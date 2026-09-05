@@ -1,3 +1,0 @@
-1. 使用 Skill tool 加载 `build-and-publish` skill，传入 version 为 v0.9.8
-2. 按 SKILL 定义的核心流程执行：校验 → 切 main 分支 → git pull → 构建镜像 → 生成 CHANGELOG → 创建 GitHub Release
-3. 输出发布报告
