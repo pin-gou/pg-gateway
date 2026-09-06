@@ -1,3 +1,8 @@
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -20,6 +25,18 @@ const models = [
 
 function parseJSON(content: string): Record<string, any> {
 	return JSON.parse(content);
+}
+
+/**
+ * Decode the python merge program that a POSIX apply command embeds as base64
+ * inside its single-line `python3 -c "… exec(base64.b64decode('…'))"` call.
+ * Unescapes the outer `'…'\''…'` idiom first so the inner script is plain.
+ */
+function embeddedProgram(cmd: string): string {
+	const unescaped = cmd.replace(/'\\''/g, "'");
+	const m = unescaped.match(/exec\(base64\.b64decode\('([A-Za-z0-9+/=]+)'\)\)/);
+	expect(m).not.toBeNull();
+	return Buffer.from(m![1], "base64").toString("utf8");
 }
 
 describe("surface derivation", () => {
@@ -327,9 +344,14 @@ describe("buildApplyCommand", () => {
 		expect(cmd).toContain(`mkdir -p "$HOME/.config/opencode"`);
 		expect(cmd).toContain(`if [ -f "$HOME/.config/opencode/opencode.json" ]; then`);
 		expect(cmd).toContain(`cp -p "$HOME/.config/opencode/opencode.json"`);
-		expect(cmd).toContain(`python3 - <<'PYEOF'`);
-		expect(cmd).toContain("json.loads(base64.b64decode(");
-		expect(cmd).toContain("json.dump(root,");
+		// The merge program is a single base64-encoded python3 -c line — never a
+		// heredoc, so terminal auto-indent cannot corrupt Python indentation.
+		expect(cmd).toContain(`python3 -c "import base64,sys; exec(base64.b64decode('\\''`);
+		expect(cmd).not.toContain("PYEOF");
+		expect(cmd).not.toContain("<<");
+		const prog = embeddedProgram(cmd);
+		expect(prog).toContain("ours = json.loads(base64.b64decode(");
+		expect(prog).toContain("json.dump(root,");
 		// Precise merge, not wholesale replacement.
 		expect(cmd).not.toContain("cat > ");
 		expect(cmd).not.toContain("CELER_ROUTE_EOF");
@@ -363,8 +385,9 @@ describe("buildApplyCommand", () => {
 		const mac = generateAgentConfig({ agent: "workbuddy", baseUrl: "http://localhost:8080", apiKey: "k", models });
 		const cmdMac = buildApplyCommand(mac, "macos")!;
 		expect(cmdMac).toContain(`"$HOME/.workbuddy/models.json"`);
-		expect(cmdMac).toContain('root["models"] = models');
-		expect(cmdMac).toContain("availableModels");
+		const macProg = embeddedProgram(cmdMac);
+		expect(macProg).toContain('root["models"] = models');
+		expect(macProg).toContain("availableModels");
 		const win = generateAgentConfig({ agent: "workbuddy", baseUrl: "http://localhost:8080", apiKey: "k", models, platform: "windows" });
 		const cmdWin = buildApplyCommand(win, "windows")!;
 		expect(cmdWin).toContain("$env:USERPROFILE\\.workbuddy\\models.json");
@@ -380,9 +403,13 @@ describe("buildApplyCommand", () => {
 			platform: "linux",
 		});
 		const cmd = buildApplyCommand(out, "linux")!;
-		expect(cmd).toContain(`("OPENAI_BASE_URL", "http://localhost:8080/v1")`);
-		expect(cmd).toContain('s.startswith(k + "=")');
-		expect(cmd).toContain("source .env");
+		const prog = embeddedProgram(cmd);
+		expect(prog).toContain(`("OPENAI_BASE_URL", "http://localhost:8080/v1")`);
+		expect(prog).toContain('s.startswith(k + "=")');
+		// The .env write happens in an sh subprocess, so self-sourcing would not
+		// persist to the user's interactive session — we guide them instead.
+		expect(cmd.split("\n").some((l) => l.startsWith("source .env"))).toBe(false);
+		expect(cmd).toContain("请在当前终端执行 source .env 使环境变量生效");
 	});
 
 	it("returns null for in-app-steps-only clients", () => {
@@ -401,9 +428,142 @@ describe("buildApplyCommand", () => {
 			platform: "linux",
 		});
 		const cmd = buildApplyCommand(out, "linux")!;
-		const match = cmd.match(/base64\.b64decode\("([^"]+)"\)/);
+		// The config payload is double base64-encoded (content inside the python
+		// program, which is itself base64 in the command) — decode both layers.
+		const prog = embeddedProgram(cmd);
+		const match = prog.match(/base64\.b64decode\("([^"]+)"\)/);
 		expect(match).not.toBeNull();
 		expect(globalThis.atob(match![1])).toBe(out.files[0].content);
+	});
+
+	it("wraps the POSIX command in a single sh -c argument with escaped inner quotes", () => {
+		const out = generateAgentConfig({ agent: "codex", baseUrl: "http://localhost:8080", apiKey: "k", models, platform: "linux" });
+		const cmd = buildApplyCommand(out, "linux")!;
+		// Any interactive shell (bash/zsh/fish/dash) runs this one command; the
+		// script body is a single single-quoted argument, so no shell-specific
+		// syntax is exposed.
+		expect(cmd.startsWith("sh -c '")).toBe(true);
+		expect(cmd.endsWith("'")).toBe(true);
+		// Unescape the '…'\''…' idiom and confirm the POSIX script round-trips
+		// intact: it must deliver python via a single-line -c (base64), never a
+		// multi-line heredoc that terminal auto-indent could reindent.
+		const unescaped = cmd.replace(/'\\''/g, "'");
+		expect(unescaped).toContain(`mkdir -p "$HOME/.codex"`);
+		expect(unescaped).toContain("exec(base64.b64decode('");
+		expect(unescaped).not.toContain("<<");
+		const prog = embeddedProgram(cmd);
+		expect(prog).toContain("re.search(r'^model");
+		expect(prog).toContain("[model_providers.celer-route]");
+	});
+
+	it("leaves the Windows PowerShell command unwrapped", () => {
+		const out = generateAgentConfig({ agent: "opencode", baseUrl: "http://localhost:8080", apiKey: "k", models, platform: "windows" });
+		const cmd = buildApplyCommand(out, "windows")!;
+		expect(cmd.startsWith("sh -c")).toBe(false);
+		expect(cmd).toContain("Copy-Item -LiteralPath $__p -Destination");
+	});
+});
+
+const hasShAndPython3 = (() => {
+	try {
+		execFileSync("sh", ["-c", "command -v python3 >/dev/null 2>&1"], { stdio: "ignore" });
+		return true;
+	} catch {
+		return false;
+	}
+})();
+
+describe("buildApplyCommand runtime (real sh -c execution)", () => {
+	it.skipIf(!hasShAndPython3)("writes a fresh opencode config to a temp HOME", () => {
+		const home = mkdtempSync(path.join(tmpdir(), "agentcfg-opencode-"));
+		const out = generateAgentConfig({
+			agent: "opencode",
+			baseUrl: "http://localhost:8080",
+			apiKey: "sk-bf-abc",
+			models,
+			platform: "linux",
+		});
+		const cmd = buildApplyCommand(out, "linux")!;
+		execFileSync("sh", ["-c", cmd], { env: { ...process.env, HOME: home } });
+		const cfg = parseJSON(readFileSync(path.join(home, ".config/opencode/opencode.json"), "utf8"));
+		expect(cfg.provider["celer-route"].options.baseURL).toBe("http://localhost:8080/v1");
+		expect(cfg.provider["celer-route"].options.apiKey).toBe("sk-bf-abc");
+	});
+
+	it.skipIf(!hasShAndPython3)("merges into an existing config without clobbering unrelated keys", () => {
+		const home = mkdtempSync(path.join(tmpdir(), "agentcfg-merge-"));
+		mkdirSync(path.join(home, ".config/opencode"), { recursive: true });
+		writeFileSync(
+			path.join(home, ".config/opencode/opencode.json"),
+			JSON.stringify({ $schema: "older", model: "some/other", keepMe: { a: 1 } }, null, 2),
+		);
+		const out = generateAgentConfig({
+			agent: "opencode",
+			baseUrl: "http://localhost:8080",
+			apiKey: "sk-bf-abc",
+			models,
+			platform: "macos",
+		});
+		const cmd = buildApplyCommand(out, "macos")!;
+		execFileSync("sh", ["-c", cmd], { env: { ...process.env, HOME: home } });
+		const cfg = parseJSON(readFileSync(path.join(home, ".config/opencode/opencode.json"), "utf8"));
+		expect(cfg.keepMe).toEqual({ a: 1 });
+		expect(cfg.model).toBe("celer-route/minimax/MiniMax-M2.1");
+	});
+
+	it.skipIf(!hasShAndPython3)("merges the codex TOML (exercises regex-literal escaping)", () => {
+		const home = mkdtempSync(path.join(tmpdir(), "agentcfg-toml-"));
+		const out = generateAgentConfig({ agent: "codex", baseUrl: "http://localhost:8080", apiKey: "sk-bf-abc", models, platform: "macos" });
+		const cmd = buildApplyCommand(out, "macos")!;
+		execFileSync("sh", ["-c", cmd], { env: { ...process.env, HOME: home } });
+		const toml = readFileSync(path.join(home, ".codex/config.toml"), "utf8");
+		expect(toml).toContain('model = "minimax/MiniMax-M2.1"');
+		expect(toml).toContain("[model_providers.celer-route]");
+		expect(toml).toContain('base_url = "http://localhost:8080/v1"');
+	});
+
+	it.skipIf(!hasShAndPython3)("survives terminal auto-indent that flattens pasted continuation lines", () => {
+		// Regression: iTerm/Warp-style smart paste adds uniform leading blanks
+		// to every continuation line. With a multi-line python heredoc this
+		// destroyed the indentation (IndentationError). The base64 python3 -c
+		// design must be immune to any number of leading blanks.
+		const home = mkdtempSync(path.join(tmpdir(), "agentcfg-flat-"));
+		mkdirSync(path.join(home, ".config/opencode"), { recursive: true });
+		writeFileSync(path.join(home, ".config/opencode/opencode.json"), '{"keepMe":{"a":1},"model":"old"}');
+		const out = generateAgentConfig({
+			agent: "opencode",
+			baseUrl: "http://localhost:8080",
+			apiKey: "sk-bf-abc",
+			models,
+			platform: "macos",
+		});
+		const cmd = buildApplyCommand(out, "macos")!;
+		const indented = cmd
+			.split("\n")
+			.map((l, i) => (i === 0 ? l : `${" ".repeat(31)}${l}`))
+			.join("\n");
+		execFileSync("sh", ["-c", indented], { env: { ...process.env, HOME: home } });
+		const cfg = parseJSON(readFileSync(path.join(home, ".config/opencode/opencode.json"), "utf8"));
+		expect(cfg.keepMe).toEqual({ a: 1 });
+		expect(cfg.model).toBe("celer-route/minimax/MiniMax-M2.1");
+	});
+
+	it.skipIf(!hasShAndPython3)("writes the env-only .env in the current directory", () => {
+		const cwd = mkdtempSync(path.join(tmpdir(), "agentcfg-env-"));
+		const home = mkdtempSync(path.join(tmpdir(), "agentcfg-envhome-"));
+		const out = generateAgentConfig({
+			agent: "openai-compatible",
+			baseUrl: "http://localhost:8080/v1",
+			apiKey: "sk-bf-abc",
+			models,
+			platform: "linux",
+		});
+		const cmd = buildApplyCommand(out, "linux")!;
+		execFileSync("sh", ["-c", `cd '${cwd}' && ${cmd}`], { env: { ...process.env, HOME: home } });
+		const env = readFileSync(path.join(cwd, ".env"), "utf8");
+		expect(env).toContain("OPENAI_BASE_URL=http://localhost:8080/v1");
+		expect(env).toContain("OPENAI_API_KEY=sk-bf-abc");
+		expect(existsSync(path.join(home, ".env"))).toBe(false);
 	});
 });
 

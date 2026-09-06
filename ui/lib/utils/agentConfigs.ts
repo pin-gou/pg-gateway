@@ -13,8 +13,10 @@
 // The functions here are pure: they take plain data and return plain strings.
 // The Web UI (workspace/agent-setup) is the single consumer. Besides the
 // ready-to-paste files/env/steps it also exposes buildApplyCommand, which
-// turns the rendered output into a self-contained bash / PowerShell one-liner
-// that writes the config directly to disk on the target OS.
+// turns the rendered output into a self-contained `sh -c '…'` (macOS/Linux)
+// or PowerShell (Windows) command that writes the config directly to disk on
+// the target OS. The POSIX form is wrapped so it runs from any interactive
+// shell (bash/zsh/fish) without depending on the user's terminal syntax.
 
 import type { ClientPlatform } from "@/lib/types/platform";
 import { displayPath } from "@/lib/utils/platform";
@@ -540,9 +542,14 @@ export function generateAgentConfig(input: AgentConfigInput): AgentConfigOutput 
  *      untouched (the backup remains).
  *
  * POSIX merges run under `python3` (near-universal on dev machines); if it is
- * missing the command fails loudly instead of clobbering. Windows merges use
- * built-in PowerShell JSON cmdlets and text handling, writing BOM-less UTF-8
- * so JSON/TOML parse cleanly on PowerShell 5.1.
+ * missing the command fails loudly instead of clobbering. The POSIX script is
+ * wrapped as a single `sh -c '…'` argument so it runs unmodified from bash,
+ * zsh, fish or dash — the user never has to switch shells. The merge program
+ * is delivered to python3 on a single base64-encoded line (never a heredoc),
+ * so terminal smart-paste/auto-indent features cannot corrupt Python's
+ * indentation. Windows merges use built-in PowerShell JSON cmdlets and text
+ * handling, writing BOM-less UTF-8 so JSON/TOML parse cleanly on PowerShell
+ * 5.1.
  *
  * Returns null when there is nothing to write (in-app-steps-only clients like
  * Cursor/Trae/ZCode/通义灵码) — the page then hides the apply tab.
@@ -564,16 +571,36 @@ export function buildApplyCommand(output: AgentConfigOutput, platform: ClientPla
 		blocks.push(
 			...(platform === "windows"
 				? ["# 已将环境变量写入当前目录 .env（KEY=VALUE）。", "# 在 PowerShell 中请使用「环境变量」标签页的 PowerShell/cmd 写法导出后使用。"]
-				: ["# 已将环境变量写入当前目录 .env，加载并生效：", "source .env"]),
+				: ["# 已将环境变量写入当前目录 .env", 'echo "请在当前终端执行 source .env 使环境变量生效（本命令在 sh 子进程中运行）"']),
 		);
 	}
-	return blocks.join("\n");
+
+	const script = blocks.join("\n");
+	if (platform === "windows") return script;
+	return `sh -c ${shSingleQuote(script)}`;
 }
 
-const PY_TAG = "PYEOF";
+/**
+ * Quote a POSIX script as a single `sh -c` argument. Any interactive shell —
+ * bash, zsh, fish, dash (the macOS/Linux default /bin/sh) — can then run
+ * `sh -c '…'` verbatim regardless of its own syntax, so macOS/Linux apply
+ * commands no longer depend on the user's terminal. Inner single quotes are
+ * escaped with the POSIX `'…'\''…'` concatenation idiom.
+ */
+function shSingleQuote(script: string): string {
+	return `'${script.replace(/'/g, "'\\''")}'`;
+}
 
-function pyScript(body: string): string {
-	return `python3 - <<'${PY_TAG}'\n${body}\n${PY_TAG}`;
+/**
+ * Run a python program from a single, indentation-immune line. The program is
+ * base64-encoded and exec'd, so no multi-line heredoc body ever reaches the
+ * terminal — tools that auto-indent pasted continuation lines (iTerm, Warp,
+ * etc.) cannot flatten the Python indentation. The `-c` argument is
+ * double-quoted for the shell; the program's single quote around the payload
+ * is handled by the outer `sh -c` quoting.
+ */
+function pyInvocation(program: string): string {
+	return `python3 -c "import base64,sys; exec(base64.b64decode('${b64(program)}'))"`;
 }
 
 /** Browser-safe base64 of a UTF-8 string (used to embed payloads without delimiter risk). */
@@ -747,20 +774,26 @@ function posixFileBlock(file: AgentConfigFile, env: AgentConfigEnv | undefined):
 	lines.push(`  cp -p "${target}" "${target}.bak-$(date +%Y%m%d-%H%M%S)" || { echo "backup failed: ${target}" >&2; exit 1; }`);
 	lines.push(`fi`);
 	lines.push(`command -v python3 >/dev/null 2>&1 || { echo "python3 is required to merge into ${target}" >&2; exit 1; }`);
+	let program: string;
 	switch (file.merge) {
 		case "json-deep":
-			lines.push(pyScript(pyJsonDeepSource(applyPath, file.content)));
+			program = pyJsonDeepSource(applyPath, file.content);
 			break;
 		case "json-models":
-			lines.push(pyScript(pyJsonModelsSource(applyPath, file.content)));
+			program = pyJsonModelsSource(applyPath, file.content);
 			break;
 		case "toml":
-			lines.push(pyScript(pyTomlSource(applyPath, file.content)));
+			program = pyTomlSource(applyPath, file.content);
 			break;
 		case "env":
-			lines.push(pyScript(pyEnvSource(applyPath, env)));
+			program = pyEnvSource(applyPath, env);
+			break;
+		default:
+			// applyPath'd files always carry a merge strategy; keep TS happy.
+			program = pyJsonDeepSource(applyPath, file.content);
 			break;
 	}
+	lines.push(pyInvocation(program));
 	return lines;
 }
 

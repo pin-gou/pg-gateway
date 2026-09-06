@@ -157,7 +157,7 @@ export default function AgentSetupView() {
 				id: "apply",
 				label: t("applyTab"),
 				code: apply,
-				description: t("applyTabDescription"),
+				description: platform === "windows" ? t("applyTabDescription") : `${t("applyTabDescription")}\n${t("applyTabShellHint")}`,
 				copyLabel: t("copy"),
 				copiedLabel: t("copied"),
 				copyText: t("copy"),

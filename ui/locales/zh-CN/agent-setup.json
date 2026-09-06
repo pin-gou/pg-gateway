@@ -62,6 +62,7 @@
 	"outputTitle": "生成的配置",
 	"applyTab": "一键应用",
 	"applyTabDescription": "把这条命令粘贴到终端运行即可一次性完成：自动备份 → 写入（或合并）配置文件 → 提示重载。已存在配置时只覆盖同名键，保留其它字段。",
+	"applyTabShellHint": "命令已用 sh -c 包装，在 bash / zsh / fish 等任意终端均可直接运行，无需切换 shell。",
 	"fileTabDescription": "这是将要写入 {{path}} 的最终内容（与「一键应用」展开后的结果一致）。需要手动复制或在自动化流程中使用时，复制下面这段。",
 	"envTab": "环境变量",
 	"envTabDescription": "在启动客户端前 `export` 这些变量即可走 celer-route，无需改动全局配置文件。适合临时调试、CI、远程开发。",

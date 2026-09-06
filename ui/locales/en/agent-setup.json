@@ -62,6 +62,7 @@
 	"outputTitle": "Generated config",
 	"applyTab": "Apply with one command",
 	"applyTabDescription": "Paste and run this in your terminal — it backs up the existing config (if any), merges the new values, and prints the path it wrote to. Only matching keys are overwritten; everything else is preserved.",
+	"applyTabShellHint": "The command is wrapped in sh -c, so bash, zsh, fish, or any other POSIX terminal runs it as-is — no shell switching needed.",
 	"fileTabDescription": "Final contents of {{path}}. Identical to what the apply command writes. Use this when you want to drop it into a script, dotfiles repo, or paste manually.",
 	"envTab": "Environment",
 	"envTabDescription": "`export` these before launching the client and the client talks to celer-route with no config file changes. Handy for quick tests, CI, and remote dev boxes.",
