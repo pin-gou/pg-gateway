@@ -16,6 +16,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import select
 import shlex
 import subprocess
 import sys
@@ -144,23 +146,58 @@ def get_choice(max_num: int) -> str:
 
 
 
+def _paginate_items(
+    items: list, page_start: int, page_size: int
+) -> tuple[list, int, int, int]:
+    """把菜单 items 拆成头部字符串 + 可分页的可选项.
+
+    Returns (visible_items, clamped_page_start, total_selectable, n_pages).
+    """
+    head = [it for it in items if isinstance(it, str)]
+    sel = [it for it in items if not isinstance(it, str)]
+    total_sel = len(sel)
+    if page_size <= 0 or total_sel == 0:
+        return items, 0, total_sel, 1
+    n_pages = (total_sel + page_size - 1) // page_size
+    page_start = max(0, min(page_start, (n_pages - 1) * page_size))
+    page_sel = sel[page_start:page_start + page_size]
+    return head + page_sel, page_start, total_sel, n_pages
+
+
 def _tab_menu_loop(
     title: str,
     tab_builders: list[Callable],
     tab_names: list[str] | None = None,
     tab_keys: list[str] | None = None,
     initial_tab: int = 0,
+    tab_loaders: list[Callable] | None = None,
+    tab_page_sizes: list[int] | None = None,
 ) -> tuple[str, int, int, int]:
     """Returns (action, tab_index, selection_index, menu_height).
 
     menu_height = len(all_lines) + 1 = number of terminal lines the menu occupies.
     0 for non-interactive path.
+
+    tab_loaders: 与 tab_builders 对齐的可选异步加载器, 切到该 tab 时先渲染
+    占位菜单, 再调用 loader 加载真实 items 并重绘.
+    tab_page_sizes: 与 tab_builders 对齐的每页可选条目数, 0 表示不分页.
     """
     has_tabs = tab_names is not None and len(tab_names) > 0
     current_tab = initial_tab
-    items, back_option = tab_builders[current_tab]()
-    selectable = sum(1 for item in items if not isinstance(item, str))
+
+    def build(idx: int):
+        return tab_builders[idx]()
+
+    items, back_option = build(current_tab)
+
     if not sys.stdin.isatty():
+        if tab_loaders and current_tab < len(tab_loaders) and tab_loaders[current_tab]:
+            loaded = tab_loaders[current_tab]()
+            if loaded is not None:
+                items = loaded
+        ps = tab_page_sizes[current_tab] if tab_page_sizes else 0
+        items, _, _, _ = _paginate_items(items, 0, ps)
+        selectable = sum(1 for item in items if not isinstance(item, str))
         print_header(title)
         if has_tabs:
             print(render_tab_bar(tab_names, current_tab, tab_keys))
@@ -176,15 +213,62 @@ def _tab_menu_loop(
             return ("select", current_tab, int(choice) - 1, 0)
 
     current = 0
+    selectable = 0
 
     with Term() as t:
         term_width = t.width
-        tab_bar = render_tab_bar(tab_names, current_tab, tab_keys) if has_tabs else ""
-        lines = render_menu(title, items, current, back_option, term_width=term_width)
-        all_lines = (lines[:3] + [tab_bar, ""] + lines[3:]) if has_tabs else lines
-        t.write("\n".join(all_lines) + "\n")
-        t.flush()
-        total_lines = len(all_lines) + 1
+        all_items = items
+        page_start = 0
+        total_lines = 0
+
+        def page_size_of(idx: int) -> int:
+            return tab_page_sizes[idx] if tab_page_sizes and idx < len(tab_page_sizes) else 0
+
+        def redraw():
+            nonlocal page_start, selectable, current, total_lines
+            ps = page_size_of(current_tab)
+            visible, page_start, total_sel, n_pages = _paginate_items(
+                all_items, page_start, ps
+            )
+            if ps > 0 and total_sel > 0:
+                cur_page = page_start // ps + 1
+                visible = visible + [
+                    _c("2;37", f"  第 {cur_page}/{n_pages} 页   用 [ ] 或上下箭头翻页")
+                ]
+            selectable = sum(1 for item in visible if not isinstance(item, str))
+            if selectable > 0 and current >= selectable:
+                current = selectable - 1
+            elif selectable == 0:
+                current = 0
+            tab_bar = (
+                render_tab_bar(tab_names, current_tab, tab_keys) if has_tabs else ""
+            )
+            lines = render_menu(
+                title, visible, current, back_option, term_width=term_width
+            )
+            all_lines = (lines[:3] + [tab_bar, ""] + lines[3:]) if has_tabs else lines
+            t.write("\n".join(all_lines) + "\n")
+            t.flush()
+            total_lines = len(all_lines) + 1
+
+        def activate(idx: int, initial: bool = False):
+            nonlocal current_tab, all_items, back_option, page_start, current
+            current_tab = idx
+            page_start = 0
+            current = 0
+            all_items, back_option = build(idx)
+            if not initial:
+                t.up_and_clear(total_lines)
+            redraw()
+            if tab_loaders and idx < len(tab_loaders) and tab_loaders[idx]:
+                loaded = tab_loaders[idx]()
+                if loaded is not None:
+                    all_items = loaded
+                    current = 0
+                    t.up_and_clear(total_lines)
+                    redraw()
+
+        activate(current_tab, initial=True)
 
         while True:
             try:
@@ -198,56 +282,54 @@ def _tab_menu_loop(
                 ch = raw.decode("ascii", errors="ignore").lower()
                 idx = next((i for i, k in enumerate(tab_keys) if k.lower() == ch), -1)
                 if 0 <= idx < len(tab_names):
-                    current_tab = idx
-                    items, back_option = tab_builders[current_tab]()
-                    selectable = sum(1 for item in items if not isinstance(item, str))
-                    current = 0
-                    t.up_and_clear(total_lines)
-                    tab_bar = (
-                        render_tab_bar(tab_names, current_tab, tab_keys)
-                        if has_tabs
-                        else ""
-                    )
-                    lines = render_menu(title, items, current, back_option, term_width=term_width)
-                    all_lines = (lines[:3] + [tab_bar, ""] + lines[3:]) if has_tabs else lines
-                    t.write("\n".join(all_lines) + "\n")
-                    t.flush()
-                    total_lines = len(all_lines) + 1
+                    activate(idx)
                     continue
 
             if raw == b"\x1b":
                 seq = t.get_escape()
+                ps = page_size_of(current_tab)
+                total_sel = sum(1 for item in all_items if not isinstance(item, str))
                 if seq == b"\x1b[A" and current > 0:
                     current -= 1
+                elif seq == b"\x1b[A" and ps > 0 and page_start > 0:
+                    page_start = max(0, page_start - ps)
+                    current = 0
                 elif seq == b"\x1b[B" and current < selectable - 1:
                     current += 1
+                elif seq == b"\x1b[B" and ps > 0 and page_start + selectable < total_sel:
+                    page_start += ps
+                    current = 0
                 elif seq == b"\x1b[C" and has_tabs:
-                    current_tab = (current_tab + 1) % len(tab_names)
-                    items, back_option = tab_builders[current_tab]()
-                    selectable = sum(1 for item in items if not isinstance(item, str))
-                    current = 0
+                    activate((current_tab + 1) % len(tab_names))
+                    continue
                 elif seq == b"\x1b[D" and has_tabs:
-                    current_tab = (current_tab - 1) % len(tab_names)
-                    items, back_option = tab_builders[current_tab]()
-                    selectable = sum(1 for item in items if not isinstance(item, str))
-                    current = 0
+                    activate((current_tab - 1) % len(tab_names))
+                    continue
                 else:
                     continue
-
                 t.up_and_clear(total_lines)
-                tab_bar = (
-                    render_tab_bar(tab_names, current_tab, tab_keys)
-                    if has_tabs
-                    else ""
-                )
-                lines = render_menu(title, items, current, back_option, term_width=term_width)
-                all_lines = (lines[:3] + [tab_bar, ""] + lines[3:]) if has_tabs else lines
-                t.write("\n".join(all_lines) + "\n")
-                t.flush()
-                total_lines = len(all_lines) + 1
+                redraw()
+                continue
 
+            elif raw in (b"[", b"{"):
+                ps = page_size_of(current_tab)
+                if ps > 0 and page_start > 0:
+                    page_start = max(0, page_start - ps)
+                    current = 0
+                    t.up_and_clear(total_lines)
+                    redraw()
+            elif raw in (b"]", b"}"):
+                ps = page_size_of(current_tab)
+                total_sel = sum(1 for item in all_items if not isinstance(item, str))
+                if ps > 0 and page_start + selectable < total_sel:
+                    page_start += ps
+                    current = 0
+                    t.up_and_clear(total_lines)
+                    redraw()
             elif raw in (b"\r", b"\n"):
-                return ("select", current_tab, current, total_lines)
+                if selectable == 0:
+                    continue
+                return ("select", current_tab, page_start + current, total_lines)
             elif raw == b"q":
                 return ("q", current_tab, 0, total_lines)
             elif raw == b"c":
@@ -266,38 +348,6 @@ def pause():
         print()
     except OSError:
         pass
-
-
-class _cooked_stdin:
-    """临时把 stdin 还原到 cooked 模式 (canonical + echo) 的上下文管理器.
-
-    Tabbed TUI 通过 termios 把 stdin 切到 raw 模式 (Term.__enter__)，
-    在此模式下 input() 拿不到完整一行. 仅 raw 输入 raw 后需要 input() 时使用.
-    """
-
-    def __enter__(self):
-        try:
-            import termios
-            fd = sys.stdin.fileno()
-            if not sys.stdin.isatty():
-                self._restore = None
-                return self
-            old = termios.tcgetattr(fd)
-            new = termios.tcgetattr(fd)
-            new[3] = new[3] | (termios.ICANON | termios.ECHO)
-            termios.tcsetattr(fd, termios.TCSADRAIN, new)
-            self._restore = old
-        except (termios.error, OSError, ImportError):
-            self._restore = None
-        return self
-
-    def __exit__(self, *args):
-        if self._restore is not None:
-            try:
-                import termios
-                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._restore)
-            except (termios.error, OSError):
-                pass
 
 
 def _action_label(action_name: str) -> str:
@@ -731,84 +781,154 @@ def _build_instance_items(
     return items
 
 
-def _build_update_items(project_root: Path) -> list:
-    version = ""
-    version_file = find_pg_skills_root(project_root) / "VERSION"
-    if version_file.is_file():
-        try:
-            version = version_file.read_text().strip()
-        except OSError:
-            version = "未知"
-    header = f"  ── 当前版本: {version} ──" if version else "  ── 当前版本: 未知 ──"
-    return [
-        _c("33", header),
-        ("检查更新", "从官方仓库拉取 tag 列表"),
-        ("强制更新到指定版本", "留空 = main 分支; 否则输入 tag (如 0.9.0)"),
-    ]
-
-
 _PG_SKILLS_OFFICIAL_REPO = "https://github.com/pin-gou/pg-skills.git"
+_UPDATE_TAGS_CACHE: dict = {"ts": 0.0, "tags": [], "error": ""}
+_update_targets: list = []
+_UPDATE_PAGE_SIZE = 10
 
 
-def _exec_update_action(idx: int, project_root: Path):
-    pg_skills_root = find_pg_skills_root(project_root)
-    version_file = pg_skills_root / "VERSION"
-    current = version_file.read_text().strip() if version_file.is_file() else ""
-
-    if idx == 0:
-        label = "检查更新"
-        print()
-        print(_c("1;36", "=" * 60))
-        print(_c("1;33", f"  {label}"))
-        print(_c("1;36", "=" * 60))
-        print(f"  仓库: {_PG_SKILLS_OFFICIAL_REPO}")
-        print(f"  拉取 tag 列表 (git ls-remote --tags --refs) ...")
-        print()
-
-        start = time.time()
+def _fetch_remote_tags() -> tuple[list, str]:
+    """拉取官方仓库 tag 列表, 30s 内复用缓存. 返回 (tags, error)."""
+    now = time.time()
+    cache = _UPDATE_TAGS_CACHE
+    if now - cache["ts"] < 30:
+        return cache["tags"], cache["error"]
+    try:
         result = subprocess.run(
             ["git", "ls-remote", "--tags", "--refs", _PG_SKILLS_OFFICIAL_REPO],
             capture_output=True,
             text=True,
             timeout=30,
         )
-        elapsed = time.time() - start
+    except subprocess.TimeoutExpired:
+        cache.update(ts=now, tags=[], error="git ls-remote 超时 (30s)")
+        return [], cache["error"]
+    if result.returncode != 0:
+        tail = (result.stderr or result.stdout).strip().splitlines()
+        cache.update(ts=now, tags=[], error=tail[-1] if tail else "git ls-remote 失败")
+        return [], cache["error"]
+    tags: list[str] = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2 and parts[1].startswith("refs/tags/"):
+            tag = parts[1][len("refs/tags/"):]
+            if tag:
+                tags.append(tag)
+    cache.update(ts=now, tags=tags, error="")
+    return tags, ""
 
-        if result.returncode != 0:
-            err = (result.stderr or result.stdout).strip().splitlines()
-            tail = err[-1] if err else "(no output)"
-            print(f"  ✗ 拉取失败: {tail}")
-            print(f"    请检查网络或访问 {_PG_SKILLS_OFFICIAL_REPO}")
-            _print_exec_stats(
-                label, [{"label": label, "duration": elapsed, "ok": False}]
-            )
-            pause()
-            return
 
-        tags: list[str] = []
-        for line in result.stdout.splitlines():
-            parts = line.split("\t")
-            if len(parts) != 2:
-                continue
-            ref = parts[1]
-            if ref.startswith("refs/tags/"):
-                tag = ref[len("refs/tags/"):]
-                if tag:
-                    tags.append(tag)
+_VERSION_RE = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(.*)$")
 
-        if not tags:
-            print("  (远程仓库未发现任何 v* tag)")
 
-        current_tag = f"v{current}" if current and not current.startswith("v") else current
-        print(f"  Current: {current_tag or '(未知)'}")
-        for t in sorted(tags):
-            marker = "  ← current" if t == current_tag else ""
-            print(f"    {t}{marker}")
-        print()
-        _print_exec_stats(
-            label,
-            [{"label": label, "duration": elapsed, "ok": True}],
-        )
+def _version_sort_key(tag: str) -> tuple:
+    """版本号排序 key: major/minor/patch 越大越新, 稳定版优先于预发布版."""
+    m = _VERSION_RE.match(tag)
+    if not m:
+        return (-1, -1, -1, 0, tag)
+    return (
+        int(m.group(1)),
+        int(m.group(2) or 0),
+        int(m.group(3) or 0),
+        1 if not m.group(4) else 0,
+        tag,
+    )
+
+
+def _build_update_targets(tags: list) -> list:
+    """main 在最前, 其余版本号从新到旧."""
+    versions = sorted(
+        (t for t in tags if t != "main"), key=_version_sort_key, reverse=True
+    )
+    return ["main"] + versions
+
+
+def _current_version(project_root: Path) -> str:
+    version_file = find_pg_skills_root(project_root) / "VERSION"
+    try:
+        if version_file.is_file():
+            return version_file.read_text().strip() or "未知"
+    except OSError:
+        pass
+    return "未知"
+
+
+def _build_update_items(project_root: Path) -> list:
+    """更新 tab 的加载占位菜单: 先切换, 显示 Loading, 再出列表."""
+    header = f"  ── 当前版本: {_current_version(project_root)} ──"
+    return [_c("33", header), _c("2;37", "  正在加载版本列表...")]
+
+
+def _load_update_items(project_root: Path) -> list:
+    """异步加载远程版本并返回完整菜单 items."""
+    tags, err = _fetch_remote_tags()
+    global _update_targets
+    _update_targets = _build_update_targets(tags) if tags else []
+    current = _current_version(project_root)
+    header = f"  ── 当前版本: {current} ──"
+    if not _update_targets:
+        msg = f"获取远程版本失败: {err}" if err else "远程仓库未发现任何 tag"
+        return [_c("33", header), _c("31", f"  ({msg})")]
+    current_tag = (
+        f"v{current}" if current != "未知" and not current.startswith("v") else current
+    )
+    items = [_c("33", header)]
+    for t in _update_targets:
+        if t == current_tag:
+            desc = "← 当前版本"
+        elif t == "main":
+            desc = "main 分支 (最新代码)"
+        else:
+            desc = "强制更新到此版本"
+        items.append((t, desc))
+    return items
+
+
+def _drain_stdin():
+    """清空 stdin 中已缓冲的按键, 避免残留字符被后续子进程/暂停读到."""
+    fd = sys.stdin.fileno()
+    while select.select([fd], [], [], 0)[0]:
+        try:
+            if not os.read(fd, 1):
+                break
+        except OSError:
+            break
+
+
+def _exec_update_action(idx: int, project_root: Path, term: Term):
+    if idx >= len(_update_targets):
+        return
+    target = _update_targets[idx]
+
+    current = _current_version(project_root)
+    current_tag = (
+        f"v{current}" if current != "未知" and not current.startswith("v") else current
+    )
+
+    print()
+    print(_c("1;36", "=" * 60))
+    print(_c("1;33", f"  强制更新到 {target}"))
+    print(_c("1;36", "=" * 60))
+    print(f"  当前版本: {current_tag or '(未知)'}")
+    print(f"  目标版本: {target}")
+    print()
+    print("  确认强制更新? [y/N] ", end="")
+    sys.stdout.flush()
+
+    confirmed = False
+    while True:
+        ch = term.getch()
+        if ch in (b"y", b"Y"):
+            print("y")
+            confirmed = True
+            break
+        if ch in (b"n", b"N", b"\r", b"\n", b"\x1b", b"", b"q", b"Q", b"b", b"B"):
+            print("n")
+            break
+    _drain_stdin()
+
+    if not confirmed:
+        print("  已取消")
         pause()
         return
 
@@ -818,30 +938,13 @@ def _exec_update_action(idx: int, project_root: Path):
         pause()
         return
 
-    if idx == 1:
-        # 在 tabbed TUI 的 raw 模式下 input() 不会缓冲, 必须先还原 cooked 模式
-        with _cooked_stdin():
-            try:
-                version = input("目标版本 (留空 = main 分支): ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                pause()
-                return
-        version_args = f" {shlex.quote(version)}" if version else ""
-        label = f"强制更新到指定版本 ({version or 'main'})"
-        cmd = (
-            f"python3 {shlex.quote(str(pg_cli))} upgrade{version_args} --force"
-        )
-    else:
-        return
-
-    print()
-    print(_c("1;36", "=" * 60))
-    print(_c("1;33", f"  {label}"))
-    print(_c("1;36", "=" * 60))
+    cmd = (
+        f"python3 {shlex.quote(str(pg_cli))} upgrade {shlex.quote(target)} --force"
+    )
     rc = run_shell(cmd, cwd=project_root)
     _print_exec_stats(
-        label, [{"label": label, "duration": 0.0, "ok": rc == 0}]
+        f"强制更新到 {target}",
+        [{"label": f"强制更新到 {target}", "duration": 0.0, "ok": rc == 0}],
     )
     pause()
 
@@ -1204,6 +1307,11 @@ def tabbed_main_menu(config: dict, project_root: Path):
                 tab_names=TAB_NAMES,
                 tab_keys=TAB_KEYS,
                 initial_tab=current_tab,
+                tab_loaders=[
+                    None, None, None, None,
+                    lambda: _load_update_items(project_root),
+                ],
+                tab_page_sizes=[0, 0, 0, 0, _UPDATE_PAGE_SIZE],
             )
 
             current_tab = tab_idx
@@ -1289,7 +1397,7 @@ def tabbed_main_menu(config: dict, project_root: Path):
                         t.flush()
                         executed_action = True
                 elif current_tab == 4:
-                    _exec_update_action(val, project_root)
+                    _exec_update_action(val, project_root, t)
                     t.write("\n")
                     t.save()
                     t.flush()
