@@ -413,8 +413,10 @@ export const createColumns = (customAppIcons: Record<string, string> = {}, group
 				const label = logAppDisplayName(app, row.original.user_agent);
 				return (
 					<div className="flex min-w-0 items-center gap-2" title={row.original.user_agent || undefined}>
-						{icon ? <img className="rounded-sm" src={icon} alt={label} width={20} height={20} loading="lazy" decoding="async" /> : null}
-						<span className="truncate text-[12px]">{label}</span>
+						{icon ? (
+							<img className="shrink-0 rounded-sm" src={icon} alt={label} width={20} height={20} loading="lazy" decoding="async" />
+						) : null}
+						<span className="max-w-[100px] min-w-0 truncate text-[12px]">{label}</span>
 					</div>
 				);
 			},
