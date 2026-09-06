@@ -63,6 +63,14 @@ const mocks = vi.hoisted(() => ({
 		],
 		builtInPreservePatterns: ["frontmatter", "fenced-code", "url"],
 	},
+	// useGetRtkRenderersQuery is hit by DisabledRenderersField during every
+	// fragment mount. Mock it to an empty list so the field renders without
+	// needing a real RTK Query store; the actual field-UI coverage is
+	// asserted in DisabledRenderersField's own test file.
+	rtkRenderersData: {
+		renderers: [],
+		detectionTypes: [],
+	},
 }));
 
 vi.mock("@/lib/store/apis/pluginsApi", async (importOriginal) => {
@@ -79,6 +87,7 @@ vi.mock("@/lib/store/apis/rtkAdminApi", async (importOriginal) => {
 	return {
 		...actual,
 		useGetRtkCavemanRulesQuery: () => ({ data: mocks.rtkCavemanRulesData, isLoading: false, isError: false }),
+		useGetRtkRenderersQuery: () => ({ data: mocks.rtkRenderersData, isLoading: false, isError: false }),
 	};
 });
 
@@ -169,9 +178,18 @@ describe("RtkFragment — EnabledSwitch mirrors provider-cooldown UX", () => {
 		fireEvent.click(screen.getByTestId("rtk-enabled-switch"));
 
 		await waitFor(() => {
+			// The toggle is a single source of truth: it must mirror into
+			// the inner config.enabled as well, otherwise a stored row with
+			// enabled:false silently disables the compression engine even
+			// though the operator believes the plugin is on. Round-tripping
+			// the existing config preserves every other knob the operator
+			// has tuned.
 			expect(mocks.updatePlugin).toHaveBeenCalledWith({
 				name: "rtk",
-				data: { enabled: true },
+				data: {
+					enabled: true,
+					config: expect.objectContaining({ enabled: true }),
+				},
 			});
 		});
 	});
@@ -184,8 +202,52 @@ describe("RtkFragment — EnabledSwitch mirrors provider-cooldown UX", () => {
 		await waitFor(() => {
 			expect(mocks.updatePlugin).toHaveBeenCalledWith({
 				name: "rtk",
-				data: { enabled: false },
+				data: {
+					enabled: false,
+					config: expect.objectContaining({ enabled: false }),
+				},
 			});
+		});
+	});
+});
+
+// RtkFragment — form save mirrors plugin-level Enabled into the inner
+// config.enabled, and the form default for the inner enabled tracks the
+// plugin-level switch. Both guards the production incident where the
+// stored config.enabled drifted to false and the RTK column in
+// /workspace/logs stayed empty despite the switch reading "on".
+describe("RtkFragment — inner config.enabled tracks the master switch", () => {
+	beforeEach(() => {
+		mocks.updatePlugin.mockReset();
+	});
+
+	it("form default for inner config.enabled tracks the plugin-level switch (on)", () => {
+		render(<RtkFragment plugin={makePlugin({ enabled: true })} />);
+		// Open the RTK tab to surface the EnableRenderers switch used to
+		// dirty the form; the actual assertion is on the submitted config.
+		fireEvent.mouseDown(screen.getByTestId("rtk-tab-rtk"));
+		fireEvent.click(screen.getByTestId("rtk-field-enable-renderers"));
+		fireEvent.click(screen.getByTestId("rtk-save-btn"));
+
+		return waitFor(() => {
+			const call = mocks.updatePlugin.mock.calls.find((c: any) => c[0]?.name === "rtk");
+			expect(call).toBeDefined();
+			const cfg = (call as any)[0].data.config as any;
+			expect(cfg.enabled).toBe(true);
+		});
+	});
+
+	it("form default for inner config.enabled tracks the plugin-level switch (off)", async () => {
+		render(<RtkFragment plugin={makePlugin({ enabled: false })} />);
+		fireEvent.mouseDown(screen.getByTestId("rtk-tab-rtk"));
+		fireEvent.click(screen.getByTestId("rtk-field-enable-renderers"));
+		fireEvent.click(screen.getByTestId("rtk-save-btn"));
+
+		await waitFor(() => {
+			const call = mocks.updatePlugin.mock.calls.find((c: any) => c[0]?.name === "rtk");
+			expect(call).toBeDefined();
+			const cfg = (call as any)[0].data.config as any;
+			expect(cfg.enabled).toBe(false);
 		});
 	});
 });

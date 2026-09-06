@@ -144,5 +144,52 @@ test.describe('RTK Plugin Configuration', () => {
 
       await pluginsPage.dismissToasts()
     })
+
+    // Regression guard for the production incident where the UI top-level
+    // toggle flipped only the plugin-level Enabled flag, leaving the inner
+    // config.enabled divergent. The toggle now mirrors the switch into the
+    // inner config so the stored row stays self-consistent and the engine
+    // gate in plugins/rtk/hooks.go (which reads config.Enabled) follows the
+    // master switch. Intercept the PUT request and assert the inner
+    // config.enabled matches the new switch state.
+    test('toggle switch mirrors plugin-level Enabled into inner config.enabled on PUT', async ({ pluginsPage, page }) => {
+      const rtkExists = await pluginsPage.pluginExists(RTK_PLUGIN_NAME)
+      expect(rtkExists).toBe(true)
+
+      const rtkButton = pluginsPage.getPluginButton(RTK_PLUGIN_NAME)
+      await rtkButton.click()
+      await page.waitForLoadState('networkidle')
+
+      // Capture PUT /api/plugins/rtk body. useUpdatePluginMutation issues
+      // the PUT immediately on toggle — no Save button required.
+      const putRequestPromise = page.waitForRequest(
+        (req) => req.method() === 'PUT' && req.url().includes('/api/plugins/rtk'),
+        { timeout: 10000 },
+      )
+
+      const enabledSwitch = page.locator('button[role="switch"]').first()
+      await expect(enabledSwitch).toBeVisible()
+      const initialState = await enabledSwitch.getAttribute('data-state')
+      const newSwitchState = initialState === 'checked' ? 'unchecked' : 'checked'
+      const newEnabled = newSwitchState === 'checked'
+      await enabledSwitch.click()
+
+      const putRequest = await putRequestPromise
+      const postData = putRequest.postData()
+      expect(postData, 'PUT /api/plugins/rtk must carry a JSON body').toBeTruthy()
+      const body = JSON.parse(postData!) as {
+        enabled?: boolean
+        config?: { enabled?: unknown; [k: string]: unknown }
+      }
+      expect(body.enabled).toBe(newEnabled)
+      // The inner config.enabled MUST mirror the switch. A missing field
+      // or a divergent value (e.g. a stale UI snapshot still saying
+      // enabled:false) is exactly the regression that put /workspace/logs
+      // RTK column in a permanently-empty state.
+      expect(body.config).toBeDefined()
+      expect(body.config!.enabled).toBe(newEnabled)
+
+      await pluginsPage.dismissToasts()
+    })
   })
 })

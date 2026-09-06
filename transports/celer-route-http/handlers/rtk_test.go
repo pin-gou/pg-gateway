@@ -367,6 +367,126 @@ func TestRtkPutConfigInvalidIntensity(t *testing.T) {
 	}
 }
 
+// TestRtkGetConfigMirrorsPluginLevelEnabled pins the API contract that
+// config.enabled in the response always equals the plugin-level Enabled
+// flag. Without this, a stored config row carrying enabled:false (a legacy
+// state from before the force-enabled-at-instantiation fix) is reported
+// as "off" in the UI even when the runtime plugin-level switch is on —
+// the exact trap that led to the empty RTK column on /workspace/logs.
+func TestRtkGetConfigMirrorsPluginLevelEnabled(t *testing.T) {
+	cs := newMemoryConfigStore()
+	// Legacy row: plugin-level enabled (master switch) is true, but the
+	// inner config still carries enabled:false from an older save where
+	// the UI form's payload omitted the field.
+	_ = cs.CreatePlugin(ctxTest(), &configstoreTables.TablePlugin{
+		Name:    rtk.PluginName,
+		Enabled: true,
+		Config: map[string]any{
+			"enabled":              false,
+			"intensity":            "standard",
+			"max_lines_per_result": 120,
+		},
+	})
+	resolver := &stubRtkResolver{found: false}
+	r, _ := newRtkTestServer(t, cs, resolver)
+
+	status, body := callGET(t, r, "/api/context/rtk/config")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	var resp RtkConfigResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if !resp.Enabled {
+		t.Error("resp.Enabled = false, want true (plugin-level master switch)")
+	}
+	if !resp.Config.Enabled {
+		t.Errorf("resp.Config.Enabled = false, want true (must mirror plugin-level Enabled); body=%s", body)
+	}
+	// Sanity: the user's other tunables survive the round-trip.
+	if resp.Config.Intensity != "standard" {
+		t.Errorf("Intensity = %q, want standard", resp.Config.Intensity)
+	}
+	if resp.Config.MaxLinesPerResult != 120 {
+		t.Errorf("MaxLinesPerResult = %d, want 120", resp.Config.MaxLinesPerResult)
+	}
+}
+
+// TestRtkPutConfigMirrorsPluginLevelEnabled pins the write contract: when
+// the operator turns the master switch on (Enabled=true) but submits a
+// config payload that still says enabled:false (e.g. a stale UI snapshot),
+// the persisted row's inner config.enabled must be forced to true so the
+// stored row is self-consistent. See getConfig comment for the same
+// single-source-of-truth rationale.
+func TestRtkPutConfigMirrorsPluginLevelEnabled(t *testing.T) {
+	cs := newMemoryConfigStore()
+	resolver := &stubRtkResolver{found: true}
+	r, _ := newRtkTestServer(t, cs, resolver)
+
+	status, body := callPUT(t, r, "/api/context/rtk/config", PutRtkConfigRequest{
+		Enabled: ptrBool(true),
+		Config: rtk.Config{
+			Enabled:           false, // stale payload
+			Intensity:         "standard",
+			MaxLinesPerResult: 120,
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	row, err := cs.GetPlugin(ctxTest(), rtk.PluginName)
+	if err != nil {
+		t.Fatalf("GetPlugin: %v", err)
+	}
+	if !row.Enabled {
+		t.Error("row.Enabled = false, want true")
+	}
+	cfgMap, ok := row.Config.(map[string]any)
+	if !ok {
+		t.Fatalf("row.Config is %T, want map[string]any", row.Config)
+	}
+	if enabled, ok := cfgMap["enabled"]; !ok || enabled != true {
+		t.Errorf("cfgMap[enabled] = %v (present=%v), want true (must mirror plugin-level Enabled)", enabled, ok)
+	}
+}
+
+// TestRtkPutConfigMirrorsPluginLevelDisabledOnDisable confirms the inverse:
+// turning the master switch off (Enabled=false) persists enabled:false in
+// the inner config too. Symmetric with the on-case above.
+func TestRtkPutConfigMirrorsPluginLevelDisabledOnDisable(t *testing.T) {
+	cs := newMemoryConfigStore()
+	_ = cs.CreatePlugin(ctxTest(), &configstoreTables.TablePlugin{
+		Name:    rtk.PluginName,
+		Enabled: true,
+		Config:  map[string]any{"enabled": true, "intensity": "standard"},
+	})
+	resolver := &stubRtkResolver{found: true}
+	r, _ := newRtkTestServer(t, cs, resolver)
+
+	status, body := callPUT(t, r, "/api/context/rtk/config", PutRtkConfigRequest{
+		Enabled: ptrBool(false),
+		Config: rtk.Config{
+			Enabled:   true, // stale payload from a previous "on" state
+			Intensity: "standard",
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	row, err := cs.GetPlugin(ctxTest(), rtk.PluginName)
+	if err != nil {
+		t.Fatalf("GetPlugin: %v", err)
+	}
+	if row.Enabled {
+		t.Error("row.Enabled = true, want false")
+	}
+	cfgMap := row.Config.(map[string]any)
+	if enabled, ok := cfgMap["enabled"]; !ok || enabled != false {
+		t.Errorf("after disable, cfgMap[enabled] = %v (present=%v), want false", enabled, ok)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/context/rtk/filters
 // ---------------------------------------------------------------------------

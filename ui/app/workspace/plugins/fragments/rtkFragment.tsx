@@ -403,9 +403,22 @@ export function EnabledSwitchPanel({ plugin, form }: { plugin: Plugin; form: Ret
 	const handleToggle = async (checked: boolean) => {
 		if (!hasUpdateAccess) return;
 		try {
+			// Mirror the switch into the inner config.enabled so the stored
+			// row stays in sync with the plugin-level Enabled. The plugin-level
+			// flag is the master switch (the framework removes disabled
+			// plugins from the pipeline), but plugins/rtk/hooks.go also reads
+			// config.Enabled at runtime — a stored enabled:false alongside an
+			// enabled plugin-level flag silently disables compression even
+			// though the UI switch reads "on". Round-tripping the existing
+			// config preserves every other knob the operator has tuned; the
+			// only field we overwrite here is enabled.
+			const existingConfig = (plugin.config || {}) as Record<string, unknown>;
 			await updatePlugin({
 				name: RTK_PLUGIN,
-				data: { enabled: checked },
+				data: {
+					enabled: checked,
+					config: { ...existingConfig, enabled: checked },
+				},
 			}).unwrap();
 			toast.success(checked ? t("rtk.enabledToast") : t("rtk.disabledToast"));
 		} catch {
@@ -1449,6 +1462,12 @@ export function RtkFragment({ plugin }: { plugin: Plugin }) {
 		// UI no longer exposes the raw JSON array.
 		const pipeline = values.caveman?.enabled ? [{ id: "rtk" }, { id: "caveman" }] : [{ id: "rtk" }];
 		values.pipeline = pipeline;
+		// Mirror the plugin-level Enabled into the inner config.enabled so
+		// the saved row's engine-level flag never drifts from the master
+		// switch. Without this the stored row omits the field and reads as
+		// false on next load, silently disabling compression even when the
+		// top-level switch is on. See plugins/rtk/hooks.go PreLLMHook.
+		values.enabled = !!plugin.enabled;
 		try {
 			await updatePlugin({
 				name: RTK_PLUGIN,
@@ -1513,6 +1532,12 @@ function FormFieldsHost({
 	const form = useForm<RTKFormValues>({
 		resolver: zodResolver(rtkConfigSchema),
 		defaultValues: {
+			// Engine-level enabled mirrors the plugin-level master switch
+			// (single source of truth: plugin.enabled). Reading the stored
+			// config first keeps the form in sync with whatever the API
+			// returned; if absent, we fall back to the master switch so
+			// legacy rows never show as "off" when the operator has RTK on.
+			enabled: pluginConfig.enabled ?? !!plugin.enabled,
 			intensity: pluginConfig.intensity || "standard",
 			max_lines_per_result: pluginConfig.max_lines_per_result || 120,
 			max_chars_per_result: pluginConfig.max_chars_per_result || 12000,

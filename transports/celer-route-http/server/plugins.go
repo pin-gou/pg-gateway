@@ -127,6 +127,20 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal rtk plugin config: %w", err)
 		}
+		// Force the engine-level Enabled flag to true at every instantiation.
+		// An *rtk.Plugin instance only ever exists when the plugin-level
+		// Enabled switch is on (the framework removes disabled plugins from
+		// the pipeline, so their hooks never run); the inner config.Enabled
+		// gate in PreLLMHook (plugins/rtk/hooks.go) must therefore mirror the
+		// plugin-level switch. Without this, a stored config row carrying
+		// enabled:false (e.g. because the UI form save never wrote the
+		// inner field, and applyConfigDefaults' all-zero safeguard does not
+		// trip once any other field is non-zero) silently disables the
+		// entire compression engine — invocations stay at 0, the RTK column
+		// in /workspace/logs stays empty, and the operator believes RTK is
+		// on because the switch reads "enabled". Single source of truth =
+		// plugin-level Enabled.
+		rtkConfig.Enabled = true
 		// Base the RTK on-disk roots (raw-output, custom filters) on the
 		// application data directory (-app-dir / APP_DIR) when configured, so
 		// container deployments persist them on the mounted volume instead of

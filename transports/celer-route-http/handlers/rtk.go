@@ -181,6 +181,16 @@ func (h *RtkHandler) getConfig(ctx *fasthttp.RequestCtx) {
 	// the raw row rather than the effective config — so the UI (and any
 	// external consumer) would see "unset" instead of the default "always".
 	rtk.ApplyConfigDefaults(&resp.Config)
+	// Mirror the plugin-level Enabled into config.Enabled so the API never
+	// reports the two flags out of sync. The plugin-level Enabled is the
+	// single source of truth (the framework removes disabled plugins from
+	// the pipeline entirely; loadBuiltinPlugin forces rtkConfig.Enabled=true
+	// at instantiation so the engine follows the plugin-level switch). The
+	// stored config.enabled may legitimately be false on legacy rows that
+	// predate this enforcement; surfacing it as false here is what led
+	// operators to believe RTK was on (switch reads "enabled") while
+	// compression never ran.
+	resp.Config.Enabled = resp.Enabled
 
 	SendJSON(ctx, resp)
 }
@@ -216,6 +226,11 @@ func (h *RtkHandler) putConfig(ctx *fasthttp.RequestCtx) {
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
+	// Mirror the plugin-level Enabled into the inner config so the stored
+	// row never carries a divergent value. See getConfig for rationale
+	// (single source of truth = plugin-level Enabled; the engine gate in
+	// plugins/rtk/hooks.go reads config.Enabled at runtime).
+	req.Config.Enabled = enabled
 
 	// Encode the typed config back to a map[string]any so the existing
 	// CreatePlugin/UpdatePlugin path can persist it without a bespoke

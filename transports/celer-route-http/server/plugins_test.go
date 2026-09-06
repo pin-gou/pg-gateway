@@ -585,3 +585,112 @@ func TestRTKInit_InvalidConfigRejected(t *testing.T) {
 		})
 	}
 }
+
+// TestInstantiatePlugin_RTK_StoredConfigDisabled_ForcesEngineOn pins the
+// single-source-of-truth contract for the RTK compression engine: whenever
+// an *rtk.Plugin instance is constructed, the engine-level Enabled flag MUST
+// be true. The plugin-level Enabled switch (the column on the config_plugins
+// row) is the master; loadBuiltinPlugin forces config.Enabled=true at every
+// instantiation, so a stored config row carrying enabled:false can never
+// silently disable compression while the plugin-level switch reads "on".
+//
+// Red phase: instantiate with a stored config that explicitly carries
+// enabled:false plus a non-zero tunable (so applyConfigDefaults' all-zero
+// safeguard cannot rescue it). The current code leaves config.Enabled=false,
+// and the assertion fails.
+// Green phase: loadBuiltinPlugin forces rtkConfig.Enabled=true before
+// rtk.Init, and the assertion passes.
+func TestInstantiatePlugin_RTK_StoredConfigDisabled_ForcesEngineOn(t *testing.T) {
+	prevLogger := logger
+	logger = noopTestLogger{}
+	defer func() { logger = prevLogger }()
+
+	// Stored row equivalent: plugin-level enabled (the master) is true, but
+	// the inner config still carries enabled:false from an older save where
+	// the UI form's payload omitted the field — the exact bug seen on the
+	// k3s instance. The other fields are non-zero on purpose so the
+	// all-zero safeguard in applyConfigDefaults does not flip them.
+	// min_tokens_to_compress is left at 0 so the request below is eligible
+	// for compression regardless of token count (the min_tokens gate is a
+	// separate concern from the enable flag; mixing them would mask the
+	// bug under test).
+	storedRTKConfig := map[string]any{
+		"enabled":              false,
+		"intensity":            "standard",
+		"max_lines_per_result": 120,
+		"max_chars_per_result": 12000,
+		"dedup_threshold":      3,
+	}
+
+	plugin, err := InstantiatePlugin(context.Background(), "rtk", nil, storedRTKConfig, &lib.Config{
+		ClientConfig: &configstore.ClientConfig{},
+	})
+	if err != nil {
+		t.Fatalf("InstantiatePlugin(rtk) with stored config carrying enabled:false returned error: %v", err)
+	}
+	rtkPlugin, ok := plugin.(*rtk.Plugin)
+	if !ok {
+		t.Fatalf("InstantiatePlugin(rtk) returned unexpected type %T", plugin)
+	}
+
+	// Drive PreLLMHook through the compression path with a chat request
+	// that contains a tool message. If the engine were disabled (the
+	// pre-fix behavior), PreLLMHook would early-return at hooks.go:88 and
+	// no metric invocation would be recorded. If the fix is in place, the
+	// invocation count strictly increases.
+	before := rtkPlugin.Stats().Invocations
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	toolContent := "On branch main\n" +
+		"Changes not staged for commit:\n" +
+		"\tmodified:   src/main.go\n" +
+		"\tmodified:   src/utils.go\n" +
+		"\tmodified:   go.mod\n" +
+		"\tmodified:   go.sum\n" +
+		"\tmodified:   Makefile\n" +
+		"\tmodified:   README.md\n"
+	req := &schemas.BifrostRequest{
+		RequestType: schemas.ChatCompletionRequest,
+		ChatRequest: &schemas.BifrostChatRequest{
+			Model: "gpt-4o",
+			Input: []schemas.ChatMessage{
+				{
+					Role: schemas.ChatMessageRoleAssistant,
+					Content: &schemas.ChatMessageContent{
+						ContentStr: ptrString("Let me check git status"),
+					},
+					ChatAssistantMessage: &schemas.ChatAssistantMessage{
+						ToolCalls: []schemas.ChatAssistantMessageToolCall{
+							{ID: ptrString("call_1"), Function: schemas.ChatAssistantMessageToolCallFunction{
+								Name:      ptrString("bash"),
+								Arguments: "git status",
+							}},
+						},
+					},
+				},
+				{
+					Role: schemas.ChatMessageRoleTool,
+					Content: &schemas.ChatMessageContent{
+						ContentStr: &toolContent,
+					},
+					ChatToolMessage: &schemas.ChatToolMessage{
+						ToolCallID: ptrString("call_1"),
+					},
+				},
+			},
+		},
+	}
+	if _, _, err := rtkPlugin.PreLLMHook(ctx, req); err != nil {
+		t.Fatalf("PreLLMHook returned error: %v", err)
+	}
+
+	after := rtkPlugin.Stats().Invocations
+	if after != before+1 {
+		t.Fatalf("rtk engine recorded %d invocations after PreLLMHook (was %d); want %d. "+
+			"A stored config with enabled:false must be force-enabled at instantiation, "+
+			"otherwise PreLLMHook short-circuits and the RTK column in /workspace/logs stays empty.",
+			after, before, before+1)
+	}
+}
+
+func ptrString(s string) *string { return &s }
