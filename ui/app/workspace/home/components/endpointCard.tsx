@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { writeClipboard } from "@/hooks/useCopyToClipboard";
 import { useGetModelsQuery, useGetProvidersQuery } from "@/lib/store/apis/providersApi";
 import { useGetVirtualKeysQuery } from "@/lib/store/apis/governanceApi";
 import { useGetCoreConfigQuery } from "@/lib/store";
@@ -94,10 +95,9 @@ export default function EndpointCard({ endpointUrl }: Props) {
 	);
 
 	const handleCopy = async (text: string) => {
-		try {
-			await navigator.clipboard.writeText(text);
+		if (await writeClipboard(text)) {
 			toast.success(t("home.endpointCard.copied"));
-		} catch {
+		} else {
 			toast.error("Copy failed");
 		}
 	};
