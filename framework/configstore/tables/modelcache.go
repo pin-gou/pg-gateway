@@ -15,8 +15,8 @@ const ModelListCacheAll = "__all__"
 // drift from the configured provider/key set.
 type TableModelListCache struct {
 	Provider        string    `gorm:"primaryKey;type:varchar(50)" json:"provider"`
-	ModelsJSON      string    `gorm:"type:mediumtext;not null" json:"-"`
-	KeyStatusesJSON string    `gorm:"type:mediumtext;not null" json:"-"`
+	ModelsJSON      string    `gorm:"type:text;not null" json:"-"`
+	KeyStatusesJSON string    `gorm:"type:text;not null" json:"-"`
 	UpdatedAt       time.Time `gorm:"index;not null" json:"updated_at"`
 }
 
