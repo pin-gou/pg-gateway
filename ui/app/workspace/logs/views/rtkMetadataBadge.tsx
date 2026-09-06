@@ -7,6 +7,7 @@ const RTK_METADATA_KEYS = new Set<string>([
 	"rtk_techniques",
 	"rtk_filter_matched",
 	"rtk_raw_output_id",
+	"rtk_raw_output_entries",
 	"rtk_pipeline_scanned",
 ]);
 
@@ -93,10 +94,40 @@ export default function RTKMetadataBadge({ keyName, value }: Props) {
 							to="/workspace/plugins/rtk/raw-output"
 							search={{ id }}
 							data-testid={`rtk-raw-output-link-${id}`}
-							className="text-blue-600 underline-offset-2 hover:underline dark:text-blue-400"
+							className="text-[13px] text-blue-600 hover:underline dark:text-blue-400"
 						>
 							{t("detailView.rtk_rawOutputLink")}
 						</Link>
+					</div>
+				</div>
+			);
+		}
+		case "rtk_raw_output_entries": {
+			const entries = Array.isArray(value)
+				? value.filter((e): e is { index: number; id: string } => {
+						return e != null && typeof e === "object" && "id" in e && "index" in e;
+					})
+				: [];
+			if (entries.length === 0) return null;
+			return (
+				<div className="flex w-full flex-col gap-2">
+					<div className="text-muted-foreground text-xs font-medium">RTK RAW OUTPUT</div>
+					<div className="flex flex-col gap-1.5">
+						{entries.map((e) => (
+							<div key={e.id} className="flex items-center gap-2">
+								<Badge variant="secondary" className="font-mono text-[10px]">
+									#{e.index}
+								</Badge>
+								<Link
+									to="/workspace/plugins/rtk/raw-output"
+									search={{ id: e.id }}
+									data-testid={`rtk-raw-output-link-${e.id}`}
+									className="text-[13px] text-blue-600 hover:underline dark:text-blue-400"
+								>
+									{t("detailView.rtk_rawOutputLink")}
+								</Link>
+							</div>
+						))}
 					</div>
 				</div>
 			);

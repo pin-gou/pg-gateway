@@ -65,7 +65,7 @@ type Config struct {
 	// RawOutputTTLHours controls how long raw-output files live on disk before
 	// the janitor reaps them. 0 disables the janitor (files live forever).
 	// Default 24, range [0, 168] (max 7 days). Only enforced when janitor is
-	// running; the file mtime + filename `<unix-ts>-<id>.log` is the source of
+	// running; the file mtime + filename `<id24>.log` is the source of
 	// truth.
 	RawOutputTTLHours int `json:"raw_output_ttl_hours,omitempty"`
 

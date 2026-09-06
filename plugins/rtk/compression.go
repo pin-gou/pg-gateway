@@ -113,6 +113,17 @@ func applyRtkCompression(ctx *schemas.BifrostContext, req *schemas.BifrostReques
 			}
 			if len(ptrs) > 0 {
 				state.RawOutputPointers = append(state.RawOutputPointers, ptrs...)
+				for _, ptr := range ptrs {
+					if ptr == nil {
+						continue
+					}
+					state.RawOutputEntries = append(state.RawOutputEntries, schemas.RTKRawOutputEntry{
+						Index:    i,
+						ID:       ptr.ID,
+						Bytes:    ptr.Bytes,
+						Redacted: ptr.Redacted,
+					})
+				}
 			}
 			if filterMatched != "" && state.FilterMatched == "" {
 				state.FilterMatched = filterMatched
@@ -176,6 +187,17 @@ func applyRtkCompression(ctx *schemas.BifrostContext, req *schemas.BifrostReques
 				}
 				if len(ptrs) > 0 {
 					state.RawOutputPointers = append(state.RawOutputPointers, ptrs...)
+					for _, ptr := range ptrs {
+						if ptr == nil {
+							continue
+						}
+						state.RawOutputEntries = append(state.RawOutputEntries, schemas.RTKRawOutputEntry{
+							Index:    i*100 + j,
+							ID:       ptr.ID,
+							Bytes:    ptr.Bytes,
+							Redacted: ptr.Redacted,
+						})
+					}
 				}
 				if filterMatched != "" && state.FilterMatched == "" {
 					state.FilterMatched = filterMatched
@@ -442,6 +464,17 @@ func applyRtkCompressionResponses(ctx *schemas.BifrostContext, req *schemas.Bifr
 		}
 		if len(ptrs) > 0 {
 			state.RawOutputPointers = append(state.RawOutputPointers, ptrs...)
+			for _, ptr := range ptrs {
+				if ptr == nil {
+					continue
+				}
+				state.RawOutputEntries = append(state.RawOutputEntries, schemas.RTKRawOutputEntry{
+					Index:    i,
+					ID:       ptr.ID,
+					Bytes:    ptr.Bytes,
+					Redacted: ptr.Redacted,
+				})
+			}
 		}
 		if filterMatched != "" && state.FilterMatched == "" {
 			state.FilterMatched = filterMatched
@@ -756,10 +789,17 @@ func processRtkTextWithCommand(ctx *schemas.BifrostContext, input string, config
 	// so the rule's regex sees the post-line-filter text. When a rule hits,
 	// the filter pipeline terminates early — no renderers, dedup, grouping,
 	// or truncate steps run on the collapsed text.
+	//
+	// MatchOutput is a compression mechanism (collapse to a summary), not a
+	// truncation (drop part of the signal). The collapsed message is a lossless
+	// summary the LLM can act on directly, so no recovery hint is appended and
+	// stats.Truncated is NOT set here (it would re-emit an on-disk recovery
+	// hint the LLM does not need). The original IS still persisted for operators
+	// via maybePersistRawOutput below, whose gate (CompressedTokens <
+	// OriginalTokens) is independent of Truncated.
 	if replaced, hit := applyMatchOutputRules(stripped, filter); hit {
 		stats.CompressedTokens = estimateTokens(replaced)
 		stats.Techniques = append(stats.Techniques, "matchOutput")
-		stats.Truncated = stats.CompressedTokens < stats.OriginalTokens
 		maybePersistRawOutput(stats, text, config, loader, cmd)
 		result := appendRawOutputHint(replaced, stats, recoveryBaseURL)
 		stats.CompressedTokens = estimateTokens(result)

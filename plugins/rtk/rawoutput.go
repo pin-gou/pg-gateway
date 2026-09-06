@@ -11,7 +11,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -123,8 +122,15 @@ func IsLikelyFailureOutput(value string) bool {
 // <appDir>/rtk/raw-output/ when the retention policy allows it, and returns
 // a pointer to the persisted file. Disk errors (EACCES, ENOSPC, etc.) are
 // handled best-effort: nil is returned and the caller should proceed without
-// the pointer. The pointer's ID is embedded in the filename as the last 24 hex
-// characters: <ts_ms>-<slug>-<id24>.log.
+// the pointer. The pointer's ID is the filename: <id24>.log.
+//
+// The filename is deterministic — it is the 24-char content hash, not a
+// timestamp+slug+ID triple. This means the same tool output content (after
+// redaction) always maps to the same file path, so an Agent loop that
+// re-sends the same tool_result in successive requests does not create
+// duplicate files: the first call writes, subsequent calls detect the
+// existing file, skip the write, and refresh the mtime so the janitor
+// keeps the file alive as long as any active request references it.
 func MaybePersistRtkRawOutput(raw string, opts PersistOptions) *RtkRawOutputPointer {
 	// Retention "never" or empty → skip.
 	if opts.Retention == RawOutputRetentionNever || opts.Retention == "" {
@@ -168,12 +174,6 @@ func MaybePersistRtkRawOutput(raw string, opts PersistOptions) *RtkRawOutputPoin
 	// Build ID: first 24 hex chars of the sha256 of the content.
 	id := shaHex[:24]
 
-	// Build command slug.
-	slug := commandSlug(opts.Command)
-
-	// Timestamp in milliseconds.
-	ts := time.Now().UnixMilli()
-
 	// Ensure the output directory exists. Dir takes priority; AppDir is the
 	// historical fallback so existing callers stay source-compatible.
 	dir := opts.Dir
@@ -185,16 +185,16 @@ func MaybePersistRtkRawOutput(raw string, opts PersistOptions) *RtkRawOutputPoin
 		return nil
 	}
 
-	base := fmt.Sprintf("%d-%s-%s", ts, slug, id)
-	logPath := filepath.Join(dir, base+".log")
-	metaPath := filepath.Join(dir, base+".meta.json")
+	// Deterministic filename: <id24>.log. Same content → same ID → same
+	// path, so duplicate writes are naturally deduped.
+	logPath := filepath.Join(dir, id+".log")
+	metaPath := filepath.Join(dir, id+".meta.json")
 
-	// Write the main .log file.
-	if err := os.WriteFile(logPath, []byte(redactedText), 0o644); err != nil {
-		// Best-effort: return nil, no panic.
-		return nil
-	}
-
+	// Dedup: if the file already exists with the expected byte count, the
+	// content is guaranteed identical (ID is a content hash). Skip the
+	// write entirely and refresh the mtime so the janitor treats the file
+	// as recently active. This is the hot path in an Agent loop where the
+	// same tool_result appears in successive requests.
 	pointer := &RtkRawOutputPointer{
 		ID:       id,
 		Path:     logPath,
@@ -202,11 +202,26 @@ func MaybePersistRtkRawOutput(raw string, opts PersistOptions) *RtkRawOutputPoin
 		SHA256:   shaHex,
 		Redacted: redacted,
 	}
+	if info, err := os.Stat(logPath); err == nil && info.Size() == int64(len(redactedText)) {
+		now := time.Now()
+		_ = os.Chtimes(logPath, now, now)
+		rawOutputPaths.Store(id, logPath)
+		return pointer
+	}
+
+	// Write the main .log file.
+	if err := os.WriteFile(logPath, []byte(redactedText), 0o644); err != nil {
+		// Best-effort: return nil, no panic.
+		return nil
+	}
 
 	// Register the path for ReadRtkRawOutput.
 	rawOutputPaths.Store(id, logPath)
 
 	// Write the sidecar .meta.json (best-effort: failure does not block).
+	// Timestamp in milliseconds — used by the meta sidecar for operator
+	// inspection, not by the janitor (which uses file mtime).
+	ts := time.Now().UnixMilli()
 	meta := struct {
 		Command   string `json:"command"`
 		Timestamp int64  `json:"timestamp"`
@@ -468,7 +483,8 @@ func ReadRtkRawOutputByID(pointerID, appDir string) (string, bool) {
 
 // ReadRtkRawOutputByIDInDir is ReadRtkRawOutputByID with an explicit dir override.
 // When dir is non-empty it short-circuits the in-memory registry and the
-// <appDir>/rtk/raw-output fallback and searches `<dir>/*-<id>.log` directly.
+// <appDir>/rtk/raw-output fallback and searches `<dir>/<id>.log` directly
+// (falling back to a glob `<dir>/*<id>.log` for legacy timestamp-prefixed files).
 // This is the path used by the HTTP handler once the plugin's resolved
 // RawOutputDir (config.RawOutputDir || <appDir>/rtk/raw-output) is known.
 func ReadRtkRawOutputByIDInDir(pointerID, appDir, dir string) (string, bool) {
@@ -477,8 +493,13 @@ func ReadRtkRawOutputByIDInDir(pointerID, appDir, dir string) (string, bool) {
 	}
 
 	// 1. Explicit dir wins (used by handler once it knows the operator-configured path).
+	// Try the deterministic path first (current format), then glob for legacy files.
 	if dir != "" {
-		if data, ok := readFirstMatch(filepath.Join(dir, "*-"+pointerID+".log")); ok {
+		directPath := filepath.Join(dir, pointerID+".log")
+		if data, err := os.ReadFile(directPath); err == nil {
+			return string(data), true
+		}
+		if data, ok := readFirstMatch(filepath.Join(dir, "*"+pointerID+".log")); ok {
 			return data, true
 		}
 	}
@@ -495,7 +516,11 @@ func ReadRtkRawOutputByIDInDir(pointerID, appDir, dir string) (string, bool) {
 	if appDir != "" {
 		appRoot := filepath.Join(appDir, "rtk", "raw-output")
 		if dir == "" || appRoot != dir {
-			if data, ok := readFirstMatch(filepath.Join(appRoot, "*-"+pointerID+".log")); ok {
+			directPath := filepath.Join(appRoot, pointerID+".log")
+			if data, err := os.ReadFile(directPath); err == nil {
+				return string(data), true
+			}
+			if data, ok := readFirstMatch(filepath.Join(appRoot, "*"+pointerID+".log")); ok {
 				return data, true
 			}
 		}
@@ -503,7 +528,7 @@ func ReadRtkRawOutputByIDInDir(pointerID, appDir, dir string) (string, bool) {
 
 	// 4. Fallback: glob under the current working directory.
 	if cwd, err := os.Getwd(); err == nil {
-		pattern := filepath.Join(cwd, "rtk", "raw-output", "*-"+pointerID+".log")
+		pattern := filepath.Join(cwd, "rtk", "raw-output", "*"+pointerID+".log")
 		if data, ok := readFirstMatch(pattern); ok {
 			return data, true
 		}
@@ -650,10 +675,17 @@ func (j *RtkRawOutputJanitor) loop(ctx context.Context) {
 	}
 }
 
-// reapOnce deletes every *.log file under j.dir whose encoded timestamp is
-// older than (now - j.ttl). Companion *.meta.json files are removed when their
-// .log sibling is removed. Errors are logged at WARN and skipped — best-effort
-// behaviour is the contract.
+// reapOnce deletes every *.log file under j.dir whose age exceeds j.ttl.
+// Companion *.meta.json files are removed when their .log sibling is removed.
+// Errors are logged at WARN and skipped — best-effort behaviour is the
+// contract.
+//
+// Two filename formats are supported:
+//   - Legacy: `<unix-ms>-<slug>-<id24>.log` — the leading timestamp is parsed
+//     from the filename (no stat needed).
+//   - Current: `<id24>.log` — no timestamp in the name; the file's mtime is
+//     used instead. MaybePersistRtkRawOutput refreshes mtime on dedup hits
+//     so the file stays alive as long as any active request references it.
 func (j *RtkRawOutputJanitor) reapOnce() {
 	if j == nil || j.dir == "" {
 		return
@@ -675,9 +707,16 @@ func (j *RtkRawOutputJanitor) reapOnce() {
 		if !strings.HasSuffix(name, ".log") {
 			continue
 		}
+		// Try filename-encoded timestamp first (legacy format). When that
+		// fails (current deterministic format has no dash prefix), fall
+		// back to the file's mtime.
 		ts, ok := rawOutputFilenameTimestamp(name)
 		if !ok {
-			continue
+			info, statErr := e.Info()
+			if statErr != nil {
+				continue
+			}
+			ts = info.ModTime().UnixMilli()
 		}
 		if ts > cutoff {
 			continue

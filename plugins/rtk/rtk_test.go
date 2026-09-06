@@ -1110,11 +1110,11 @@ func TestStateRawOutputPointersPropagation(t *testing.T) {
 		t.Errorf("persisted raw output file missing: %v", err)
 	}
 
-	// The file name must embed the same ID as the pointer:
-	// <ts_ms>-<slug>-<id24>.log → base ends with "-<ID>.log".
+	// The file name is the deterministic <id24>.log — same content always
+	// maps to the same path so Agent loops don't create duplicate files.
 	base := filepath.Base(ptr.Path)
-	if !strings.HasSuffix(base, "-"+ptr.ID+".log") {
-		t.Errorf("pointer ID %q not embedded in file name %q", ptr.ID, base)
+	if base != ptr.ID+".log" {
+		t.Errorf("expected file name %q, got %q", ptr.ID+".log", base)
 	}
 }
 

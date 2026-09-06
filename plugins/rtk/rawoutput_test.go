@@ -181,10 +181,10 @@ func countLogFiles(t *testing.T, appDir string) int {
 }
 
 // TestRetentionPolicies (V-plugins-1) verifies the three retention strategies
-// take effect per configuration and produced filenames strictly follow the
-// <ts_ms>-<slug>-<id24>.log template.
+// take effect per configuration and produced filenames follow the
+// deterministic <id24>.log template (content-hash-based, no timestamp).
 func TestRetentionPolicies(t *testing.T) {
-	rawFilename := regexp.MustCompile(`^\d{13}-[A-Za-z0-9_-]+-[0-9a-f]{24}\.log$`)
+	rawFilename := regexp.MustCompile(`^[0-9a-f]{24}\.log$`)
 
 	t.Run("retention_never_writes_nothing", func(t *testing.T) {
 		appDir := t.TempDir()
@@ -313,7 +313,7 @@ func TestRetentionPolicies(t *testing.T) {
 		}
 		for _, e := range entries {
 			if filepath.Ext(e.Name()) == ".log" && !rawFilename.MatchString(e.Name()) {
-				t.Errorf("filename %q does not match <ts_ms>-<slug>-<id24>.log template", e.Name())
+				t.Errorf("filename %q does not match <id24>.log template", e.Name())
 			}
 		}
 	})
@@ -496,6 +496,98 @@ func TestJanitor_FilenameTimestampParser(t *testing.T) {
 		if ok != tc.want {
 			t.Errorf("rawOutputFilenameTimestamp(%q) ok=%v, want %v", tc.in, ok, tc.want)
 		}
+	}
+}
+
+// TestDedupSameContentSkipsWrite verifies the core dedup contract: when the
+// same tool output content (after redaction) is persisted multiple times —
+// the Agent-loop scenario where tool1's result reappears in every subsequent
+// request — only ONE file is written on disk. The second call detects the
+// existing file, skips the write, refreshes the mtime, and returns a pointer
+// with the same ID and path.
+func TestDedupSameContentSkipsWrite(t *testing.T) {
+	appDir := t.TempDir()
+	content := "=== RUN   TestFoo\n--- FAIL: TestFoo (0.01s)\n    foo_test.go:42: boom\nFAIL"
+
+	ptr1 := MaybePersistRtkRawOutput(content, PersistOptions{
+		Retention: RawOutputRetentionAlways,
+		Command:   "go test",
+		AppDir:    appDir,
+	})
+	if ptr1 == nil {
+		t.Fatal("first persist: expected non-nil pointer")
+	}
+	if n := countLogFiles(t, appDir); n != 1 {
+		t.Fatalf("first persist: expected 1 file, got %d", n)
+	}
+
+	// Second call with identical content — must NOT create a new file.
+	ptr2 := MaybePersistRtkRawOutput(content, PersistOptions{
+		Retention: RawOutputRetentionAlways,
+		Command:   "go test",
+		AppDir:    appDir,
+	})
+	if ptr2 == nil {
+		t.Fatal("second persist: expected non-nil pointer")
+	}
+	if ptr1.ID != ptr2.ID {
+		t.Errorf("IDs differ: %q vs %q", ptr1.ID, ptr2.ID)
+	}
+	if ptr1.Path != ptr2.Path {
+		t.Errorf("paths differ: %q vs %q", ptr1.Path, ptr2.Path)
+	}
+	if n := countLogFiles(t, appDir); n != 1 {
+		t.Errorf("second persist: expected 1 file (dedup), got %d", n)
+	}
+}
+
+// TestDedupDifferentContentWritesNewFile verifies that different content
+// produces a different file (no false-positive dedup).
+func TestDedupDifferentContentWritesNewFile(t *testing.T) {
+	appDir := t.TempDir()
+	MaybePersistRtkRawOutput("first unique output", PersistOptions{
+		Retention: RawOutputRetentionAlways,
+		AppDir:    appDir,
+	})
+	MaybePersistRtkRawOutput("second unique output", PersistOptions{
+		Retention: RawOutputRetentionAlways,
+		AppDir:    appDir,
+	})
+	if n := countLogFiles(t, appDir); n != 2 {
+		t.Errorf("expected 2 files for 2 different contents, got %d", n)
+	}
+}
+
+// TestJanitor_ReapsNewFormatByMtime verifies the janitor reaps deterministic
+// <id24>.log files (no timestamp prefix) using file mtime instead.
+func TestJanitor_ReapsNewFormatByMtime(t *testing.T) {
+	dir := t.TempDir()
+	// Create a new-format file with an old mtime.
+	oldPath := filepath.Join(dir, "0123456789abcdef01234567.log")
+	if err := os.WriteFile(oldPath, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(oldPath, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	// Create a new-format file with a fresh mtime.
+	freshPath := filepath.Join(dir, "fedcba9876543210fedcba98.log")
+	if err := os.WriteFile(freshPath, []byte("fresh"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	j := NewRtkRawOutputJanitor(dir, time.Hour, nil)
+	if j == nil {
+		t.Fatal("NewRtkRawOutputJanitor returned nil")
+	}
+	j.reapOnce()
+
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Errorf("expected expired new-format file to be reaped by mtime, stat err=%v", err)
+	}
+	if _, err := os.Stat(freshPath); err != nil {
+		t.Errorf("expected fresh new-format file to survive, stat err=%v", err)
 	}
 }
 

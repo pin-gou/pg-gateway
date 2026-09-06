@@ -19,6 +19,12 @@ type CompressionState struct {
 	// index where the pipeline did compress is recovered from the raw-output
 	// file referenced by RawOutputPointers (rtk_raw_output_id).
 	ScannedIndices []int
+	// RawOutputEntries carries per-message raw-output pointer metadata
+	// (scanned index + pointer ID) so the log detail view can render one
+	// "View raw output" link per compressed message. Populated alongside
+	// RawOutputPointers during compression; consumed by PostLLMHook which
+	// exposes them via BifrostContextKeyRTKRawOutputEntries.
+	RawOutputEntries []schemas.RTKRawOutputEntry
 }
 
 // NewCompressionState creates a new CompressionState with default values.
@@ -27,6 +33,7 @@ func NewCompressionState() *CompressionState {
 		Techniques:        make([]string, 0),
 		RawOutputPointers: make([]*RtkRawOutputPointer, 0),
 		ScannedIndices:    make([]int, 0),
+		RawOutputEntries:  make([]schemas.RTKRawOutputEntry, 0),
 	}
 }
 

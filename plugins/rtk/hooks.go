@@ -236,6 +236,9 @@ func (p *Plugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostR
 	if len(state.RawOutputPointers) > 0 && state.RawOutputPointers[0] != nil {
 		ctx.SetValue(schemas.BifrostContextKeyRTKRawOutputID, state.RawOutputPointers[0].ID)
 	}
+	if len(state.RawOutputEntries) > 0 {
+		ctx.SetValue(schemas.BifrostContextKeyRTKRawOutputEntries, state.RawOutputEntries)
+	}
 
 	// Record which message indices the RTK pipeline scanned this request so the
 	// log detail diff view can distinguish "did not participate" from

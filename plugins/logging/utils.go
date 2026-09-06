@@ -998,7 +998,24 @@ func mergeRealtimeMetadata(metadata map[string]interface{}, ctx *schemas.Bifrost
 	// PipelineScanned lets the log detail diff view distinguish "did not
 	// participate" from "participated but not compressed" without storing any
 	// message text. The original text for any compressed index is recovered
-	// via rtk_raw_output_id (set above).
+	// via rtk_raw_output_id (set above) or, when multiple tool outputs were
+	// compressed, via rtk_raw_output_entries (one entry per compressed message
+	// carrying the scanned index + its own pointer ID).
+	if entries, ok := ctx.Value(schemas.BifrostContextKeyRTKRawOutputEntries).([]schemas.RTKRawOutputEntry); ok && len(entries) > 0 {
+		if metadata == nil {
+			metadata = make(map[string]interface{})
+		}
+		arr := make([]map[string]interface{}, len(entries))
+		for i, e := range entries {
+			arr[i] = map[string]interface{}{
+				"index":    e.Index,
+				"id":       e.ID,
+				"bytes":    e.Bytes,
+				"redacted": e.Redacted,
+			}
+		}
+		metadata["rtk_raw_output_entries"] = arr
+	}
 	if scanned, ok := ctx.Value(schemas.BifrostContextKeyRTKPipelineScanned).([]int); ok && len(scanned) > 0 {
 		if metadata == nil {
 			metadata = make(map[string]interface{})

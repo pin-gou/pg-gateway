@@ -19,6 +19,11 @@ export interface CompressedItem {
 	content: string;
 }
 
+interface RawOutputEntry {
+	index: number;
+	id: string;
+}
+
 interface Props {
 	metadata: Record<string, unknown> | undefined;
 	compressedItems?: CompressedItem[];
@@ -26,16 +31,22 @@ interface Props {
 
 // RTKCompressionDiffView renders the diff between the pre-compression raw tool
 // output and the post-compression message body. The pre-compression text is
-// recovered on demand via `GET /api/context/rtk/raw-output/{id}?raw=1` using
-// the `rtk_raw_output_id` metadata left by the RTK plugin's PostLLMHook. A
-// `rtk_pipeline_scanned` metadata entry marks messages the pipeline evaluated
-// but did not compress — the diff view surfaces those as "participated but
-// not compressed" so operators can see the pipeline actually ran.
+// recovered on demand via `GET /api/context/rtk/raw-output/{id}?raw=1`.
 //
-// The component is intentionally read-only: it never invokes side effects
-// and never re-derives data. All four states (uncompressed, snapshot
-// disabled, populated, failed-to-fetch) share the same outer wrapper so the
-// layout doesn't jump when the operator toggles between tabs.
+// Two metadata shapes are supported:
+//   - rtk_raw_output_entries: [{index, id, bytes, redacted}, ...] — the
+//     current schema. Each compressed tool output has its own raw-output
+//     file and pointer ID. Each message row independently fetches its own
+//     original by pointer ID, so the diff is precise per message.
+//   - rtk_raw_output_id: single string (first pointer only) — the legacy
+//     schema. The single raw-output file is fetched once and split across
+//     message slots by "\n\n" separator (matching the legacy snapshot.go
+//     merged-mode wire shape). This path is kept for logs recorded before
+//     the multi-entry change.
+//
+// A `rtk_pipeline_scanned` metadata entry marks messages the pipeline
+// evaluated but did not compress — the diff view surfaces those as
+// "participated but not compressed" so operators can see the pipeline ran.
 export default function RTKCompressionDiffView({ metadata, compressedItems }: Props) {
 	const { t: tFn } = useTranslation("logs");
 
@@ -43,10 +54,11 @@ export default function RTKCompressionDiffView({ metadata, compressedItems }: Pr
 	const techniques = stringArrayFromMetadata(metadata?.rtk_techniques);
 	const filterMatched = stringFromMetadata(metadata?.rtk_filter_matched);
 	const rawOutputID = stringFromMetadata(metadata?.rtk_raw_output_id);
+	const rawOutputEntries = rawOutputEntriesFromMetadata(metadata?.rtk_raw_output_entries);
 	const scannedIndices = numberArrayFromMetadata(metadata?.rtk_pipeline_scanned);
 
 	// Empty / not-triggered state: no raw-output pointer AND no scanned indices.
-	const compressedFlag = techniques.length > 0 || (scannedIndices.length ?? 0) > 0 || !!rawOutputID;
+	const compressedFlag = techniques.length > 0 || (scannedIndices.length ?? 0) > 0 || !!rawOutputID || rawOutputEntries.length > 0;
 	if (!compressedFlag && ratio === null) {
 		return (
 			<div
@@ -63,7 +75,7 @@ export default function RTKCompressionDiffView({ metadata, compressedItems }: Pr
 	// but no compression fired (or retention is "never"). Show the post-
 	// compression message bodies alongside a banner prompting the operator
 	// to enable raw-output retention if they want the diff.
-	if (!rawOutputID) {
+	if (!rawOutputID && rawOutputEntries.length === 0) {
 		return (
 			<div className="space-y-4" data-testid="rtk-diff-disabled">
 				<RTKHeader ratio={ratio} techniques={techniques} filterMatched={filterMatched} />
@@ -98,13 +110,124 @@ export default function RTKCompressionDiffView({ metadata, compressedItems }: Pr
 		);
 	}
 
-	// Compressed path: fetch the raw-output file and split it across the
-	// compressed message slots. The raw-output file may contain one tool
-	// output or several joined by "\n\n" (matches the legacy snapshot.go
-	// merged-mode separator), so we split on that marker first; any slot
-	// without a match is left empty and a banner explains the heuristic.
-	return <PopulatedDiff metadata={metadata} rawOutputID={rawOutputID} compressedItems={compressedItems} scannedIndices={scannedIndices} />;
+	// Multi-entry path (current schema): each compressed tool output has its
+	// own raw-output file. Each message row independently fetches its own
+	// original by pointer ID, so the diff is precise per message.
+	if (rawOutputEntries.length > 0) {
+		return (
+			<PopulatedDiffMulti
+				metadata={metadata}
+				rawOutputEntries={rawOutputEntries}
+				compressedItems={compressedItems}
+				scannedIndices={scannedIndices}
+			/>
+		);
+	}
+
+	// Legacy single-ID path (old logs): fetch one file and split it.
+	return <PopulatedDiff metadata={metadata} rawOutputID={rawOutputID!} compressedItems={compressedItems} scannedIndices={scannedIndices} />;
 }
+
+// ---------------------------------------------------------------------------
+// Multi-entry path
+// ---------------------------------------------------------------------------
+
+interface PopulatedDiffMultiProps {
+	metadata: Record<string, unknown> | undefined;
+	rawOutputEntries: RawOutputEntry[];
+	compressedItems?: CompressedItem[];
+	scannedIndices: ScannedIndexEntry[];
+}
+
+function PopulatedDiffMulti({ metadata, rawOutputEntries, compressedItems, scannedIndices }: PopulatedDiffMultiProps) {
+	const { t: tFn } = useTranslation("logs");
+
+	const ratio = numberFromMetadata(metadata?.rtk_compression_ratio);
+	const techniques = stringArrayFromMetadata(metadata?.rtk_techniques);
+	const filterMatched = stringFromMetadata(metadata?.rtk_filter_matched);
+
+	// Build index → entry map so each message row can look up its pointer.
+	const entryByIndex = new Map<number, RawOutputEntry>();
+	for (const e of rawOutputEntries) {
+		entryByIndex.set(e.index, e);
+	}
+
+	const scannedSet = new Set(scannedIndices.map((entry) => entry.index));
+
+	return (
+		<div className="space-y-4" data-testid="rtk-diff-populated-multi">
+			<RTKHeader ratio={ratio} techniques={techniques} filterMatched={filterMatched} />
+			{compressedItems == null || compressedItems.length === 0 ? (
+				<div className="text-muted-foreground rounded-sm border border-dashed p-6 text-center text-sm">
+					{tFn("detailView.rtkNoSnapshots")}
+				</div>
+			) : (
+				<div className="flex flex-col gap-4">
+					{compressedItems.map((comp) => (
+						<MessageDiffRow
+							key={`msg-${comp.index}`}
+							index={comp.index}
+							compressedContent={comp.content}
+							participated={scannedSet.has(comp.index)}
+							entry={entryByIndex.get(comp.index)}
+						/>
+					))}
+				</div>
+			)}
+		</div>
+	);
+}
+
+// MessageDiffRow fetches its own original text by pointer ID (multi-entry
+// path) or shows an empty ORIGINAL pane when the message was scanned but
+// not compressed (no entry for this index).
+function MessageDiffRow({
+	index,
+	compressedContent,
+	participated,
+	entry,
+}: {
+	index: number;
+	compressedContent: string;
+	participated: boolean;
+	entry?: RawOutputEntry;
+}) {
+	const { t } = useTranslation("logs");
+
+	// Only fetch when this message has a raw-output pointer (i.e. it was
+	// actually compressed and persisted). Scanned-but-not-compressed
+	// messages have no entry, so skip the fetch entirely.
+	const {
+		data: rawText,
+		isLoading,
+		isError,
+	} = useGetRtkRawOutputQuery(entry?.id ?? "", {
+		skip: !entry?.id,
+	});
+
+	return (
+		<div className="rounded-sm border" data-testid={`rtk-diff-message-${index}`}>
+			<div className="bg-muted/20 flex items-center justify-between rounded-t-sm border-b px-4 py-2 text-xs">
+				<div className="flex items-center gap-2 font-medium">
+					<span>{t("detailView.rtkMessageLabel", { index: index >= 0 ? index : 0 })}</span>
+					{participated && (
+						<Badge variant="outline" className="text-[10px]" data-testid={`rtk-diff-participated-${index}`}>
+							{t("detailView.rtkParticipated")}
+						</Badge>
+					)}
+				</div>
+			</div>
+			<div className="relative grid grid-cols-1 gap-0 md:grid-cols-2">
+				<DiffPane label={t("detailView.rtkOriginalLabel")} content={rawText ?? ""} side="original" loading={isLoading} error={isError} />
+				<DiffPane label={t("detailView.rtkCompressedLabel")} content={compressedContent} side="compressed" />
+			</div>
+		</div>
+	);
+}
+
+// ---------------------------------------------------------------------------
+// Legacy single-ID path (old logs)
+// ---------------------------------------------------------------------------
 
 interface PopulatedDiffProps {
 	metadata: Record<string, unknown> | undefined;
@@ -122,11 +245,6 @@ function PopulatedDiff({ metadata, rawOutputID, compressedItems, scannedIndices 
 
 	const { data: rawText, isLoading, isError } = useGetRtkRawOutputQuery(rawOutputID);
 
-	// Map the raw output text to the compressedItems slots. The Go snapshot
-	// builder joined entries with "\n\n" when serialising merged mode; the
-	// raw-output persistence layer writes one tool_result per call, but a
-	// single tool call may have triggered multiple compression passes that
-	// share one file. Splitting on "\n\n" matches the legacy wire shape.
 	const originalByIndex = splitRawOutputByIndex(rawText, compressedItems);
 
 	return (
@@ -227,7 +345,20 @@ function RTKSplitDiff({
 	);
 }
 
-function DiffPane({ label, content, side }: { label: string; content: string; side: "original" | "compressed" }) {
+function DiffPane({
+	label,
+	content,
+	side,
+	loading,
+	error,
+}: {
+	label: string;
+	content: string;
+	side: "original" | "compressed";
+	loading?: boolean;
+	error?: boolean;
+}) {
+	const { t: tFn } = useTranslation("logs");
 	const sideClass =
 		side === "original"
 			? "border-border bg-muted/10"
@@ -235,12 +366,22 @@ function DiffPane({ label, content, side }: { label: string; content: string; si
 	return (
 		<div className={`flex min-h-0 flex-col border-l first:border-l-0 md:border-l ${sideClass}`}>
 			<div className="text-muted-foreground border-b px-3 py-1.5 text-xs font-medium tracking-wide uppercase">{label}</div>
-			<pre className="max-h-[60vh] overflow-auto px-3 py-2 font-mono text-[11px] leading-relaxed break-all whitespace-pre-wrap">
-				{content}
-			</pre>
+			{loading ? (
+				<div className="text-muted-foreground px-3 py-2 text-[11px] italic">{tFn("detailView.rtkRawOutputFetchLoading")}</div>
+			) : error ? (
+				<div className="px-3 py-2 text-[11px] text-amber-600 italic dark:text-amber-400">{tFn("detailView.rtkRawOutputFetchError")}</div>
+			) : (
+				<pre className="max-h-[60vh] overflow-auto px-3 py-2 font-mono text-[11px] leading-relaxed break-all whitespace-pre-wrap">
+					{content}
+				</pre>
+			)}
 		</div>
 	);
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function numberFromMetadata(v: unknown): number | null {
 	if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -266,15 +407,25 @@ function numberArrayFromMetadata(v: unknown): ScannedIndexEntry[] {
 	return v.filter((entry): entry is number => typeof entry === "number" && Number.isFinite(entry)).map((index) => ({ index }));
 }
 
+function rawOutputEntriesFromMetadata(v: unknown): RawOutputEntry[] {
+	if (!Array.isArray(v)) return [];
+	return v
+		.filter((entry): entry is Record<string, unknown> => entry != null && typeof entry === "object")
+		.map((entry) => ({
+			index: typeof entry.index === "number" ? entry.index : Number(entry.index) || 0,
+			id: typeof entry.id === "string" ? entry.id : String(entry.id ?? ""),
+		}))
+		.filter((entry) => entry.id.length > 0);
+}
+
 // splitRawOutputByIndex partitions the raw-output file body across the
-// compressedItems slots. The RTK plugin stores one raw-output file per
-// actually-compressed tool_result, but several messages may be persisted in
-// sequence joined by "\n\n" — the same separator the legacy snapshot.go
-// merged-mode builder used. We split on that marker and assign the i-th
-// chunk to compressedItems[i]. When the count doesn't match (e.g. only one
-// compressed item but multiple chunks) we fall back to "all chunks to the
-// first item, rest empty" so the operator sees something rather than a
-// silent zero-row table.
+// compressedItems slots (legacy single-ID path only). The RTK plugin stores
+// one raw-output file per actually-compressed tool_result, but several
+// messages may be persisted in sequence joined by "\n\n" — the same
+// separator the legacy snapshot.go merged-mode builder used. We split on
+// that marker and assign the i-th chunk to compressedItems[i]. When the
+// count doesn't match we fall back to "all chunks to the first item" so
+// the operator sees something rather than a silent zero-row table.
 function splitRawOutputByIndex(rawText: string | undefined, compressedItems?: CompressedItem[]): Map<number, string> {
 	const out = new Map<number, string>();
 	if (!rawText || compressedItems == null || compressedItems.length === 0) {

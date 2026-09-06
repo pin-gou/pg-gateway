@@ -1455,11 +1455,16 @@ export function LogDetailView({
 							</div>
 						)}
 					</div>
-					<div className="flex shrink-0 items-center gap-1.5 rounded-sm border bg-white px-2 py-1 text-[12px] font-medium dark:bg-zinc-900">
+					<Link
+						to="/workspace/providers/$id"
+						params={{ id: log.provider }}
+						className="hover:bg-muted flex shrink-0 items-center gap-1.5 rounded-sm border bg-white px-2 py-1 text-[12px] font-medium transition-colors dark:bg-zinc-900"
+						data-testid="logdetails-header-provider-link"
+					>
 						<RenderProviderIcon provider={log.provider as ProviderIconType} size="xs" />
 						<span className="text-muted-foreground text-[10px] font-semibold tracking-wider uppercase">{t("detailView.provider")}</span>
 						<span>{log.provider}</span>
-					</div>
+					</Link>
 				</div>
 				<div className="border-border grid grid-cols-2 border-t md:grid-cols-5">
 					<HeroStat
@@ -2333,6 +2338,7 @@ export function LogDetailView({
 						log.metadata &&
 						Object.keys(log.metadata).filter((k) => {
 							if (k === "isAsyncRequest") return false;
+							if (k === "rtk_raw_output_id" && "rtk_raw_output_entries" in log.metadata!) return false;
 							if (
 								isRealtimeTurn &&
 								[
@@ -2356,6 +2362,7 @@ export function LogDetailView({
 										{Object.entries(log.metadata)
 											.filter(([key]) => {
 												if (key === "isAsyncRequest") return false;
+												if (key === "rtk_raw_output_id" && "rtk_raw_output_entries" in log.metadata!) return false;
 												if (
 													isRealtimeTurn &&
 													[
