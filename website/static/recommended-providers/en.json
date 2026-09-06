@@ -1,6 +1,6 @@
 {
-  "version": "2026-08-29",
-  "updated_at": "2026-08-29T10:18:21Z",
+  "version": "2026-09-06",
+  "updated_at": "2026-09-06T08:00:00Z",
   "bundles": [
     {
       "id": "coding",
@@ -42,22 +42,7 @@
             "Create an API key"
           ],
           "is_keyless": false,
-          "notes": "Free tier with daily rate limits"
-        },
-        {
-          "provider": "gmicloud",
-          "models": [
-            "minimax/MiniMax-M3",
-            "minimax/MiniMax-M2.7"
-          ],
-          "apply_url": "https://console.gmicloud.ai",
-          "apply_steps": [
-            "Sign up for an account",
-            "Create an API key"
-          ],
-          "is_keyless": false,
-          "notes": "MiniMax Week promo: M3 & M2.7 free until 2026-09-06",
-          "free_valid_until": "2026-09-06"
+          "notes": "Free tier: ~30 RPM / 1,000 requests per day"
         }
       ]
     },
@@ -90,6 +75,19 @@
           ],
           "is_keyless": false,
           "notes": "Free models such as GLM-Z1-9B reasoning"
+        },
+        {
+          "provider": "zhipu",
+          "models": [
+            "glm-4-flash"
+          ],
+          "apply_url": "https://open.bigmodel.cn",
+          "apply_steps": [
+            "Sign up for an account",
+            "Create an API key on the Zhipu open platform"
+          ],
+          "is_keyless": false,
+          "notes": "GLM-4-Flash permanently free"
         }
       ]
     },
